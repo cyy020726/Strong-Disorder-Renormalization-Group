@@ -1070,7 +1070,7 @@ class SDRGEnsembleGUI:
 
         # ---------- Legend ----------
         blue_patch = Patch(facecolor=(0.2, 0.4, 1.0), edgecolor='black',
-                           label=r'Relative coupling $J$')
+                           label=r'Relative bond energy $J$')
         red_patch = Patch(facecolor=(1.0, 0.2, 0.2), edgecolor='black',
                           label='Decimated bonds')
 
