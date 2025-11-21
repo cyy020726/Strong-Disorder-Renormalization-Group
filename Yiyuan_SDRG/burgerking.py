@@ -13,7 +13,7 @@ from matplotlib.patches import Polygon, Patch
 def sample_couplings(L: int, M: int, dist_name: str, rng: np.random.Generator) -> np.ndarray:
     """
     Sample an M x L array of positive couplings J_{s,i} according
-    to a chosen distribution. Each row = one Hamiltonian; each column = bond (periodic).
+    to a chosen distribution. Each row = one Hamiltonian; each column = bond (periodic)
     """
     if dist_name == "Uniform(0,1)":
         J = rng.random((M, L))
