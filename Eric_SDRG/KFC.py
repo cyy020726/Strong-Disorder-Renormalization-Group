@@ -222,6 +222,9 @@ def length_vs_energy_stats(all_lengths, all_omegas):
     return np.asarray(all_lengths), np.asarray(all_omegas)
 
 def plot_gap_distribution(gaps, bins=50, title="Gap Distribution"):
+    #this function takes the lowest energy ecitation gaps from one ensemble before and plots them 
+    #it works better to visualize on a log scale, check why the gaps are distributed on a log scale
+    
     plt.figure(figsize=(5,4))
     plt.hist(-np.log(gaps), bins=bins, density=True, alpha=0.7)
     plt.xlabel("Gap Δ")
@@ -231,16 +234,141 @@ def plot_gap_distribution(gaps, bins=50, title="Gap Distribution"):
     plt.tight_layout()
     plt.show()
 
+def plot_correlations(r_vals, C_r):
+    theory_vals = 1/r_vals**2
+    scale_factor = r_vals[1]/theory_vals[1]
+    print(theory_vals)
+    theory_vals = theory_vals * scale_factor
+    print(scale_factor)
+    plt.figure(figsize=(5,4))
+    plt.loglog(r_vals[1:], -C_r[1:], 'o-', markersize=4)
+    plt.loglog(r_vals[1:], theory_vals[1:])
+    plt.xlabel(" log distance r")
+    plt.ylabel(r"$- \langle S_i \cdot S_{i+r} \rangle$")
+    plt.title("Log Average Spin Correlations")
+    plt.tight_layout()
+    plt.show()
 
+
+def plot_length_vs_energy(all_lengths, all_omegas):
+    plt.figure(figsize=(6,4))
+    plt.scatter(all_lengths, all_omegas, s=4, alpha=0.3)
+    plt.yscale("log")
+    plt.xlabel("Singlet length ℓ")
+    plt.ylabel("RG scale Ω")
+    plt.title("Length vs RG Scale")
+    plt.tight_layout()
+    plt.show()
+
+def plot_fisher_scaling(all_lengths, all_omegas):
+    ell = np.array(all_lengths)
+    Omega = np.array(all_omegas)
+
+    plt.figure(figsize=(5,4))
+    plt.scatter(np.sqrt(ell), -np.log(Omega), s=4, alpha=0.3)
+
+    plt.xlabel(r"$\sqrt{\ell}$")
+    plt.ylabel(r"$-\log \Omega$")
+    plt.title("Fisher Activated Scaling")
+    plt.tight_layout()
+    plt.show()
+    
+    
+def run_scaling_study(L_list, M, dist_name="Uniform(0,1)", seed=0):
+    """
+    Run SDRG for multiple system sizes L in L_list.
+    
+    Returns:
+      gaps_list: list of arrays, each of shape (M,)
+    """
+    gaps_list = []
+    rng = np.random.default_rng(seed)
+
+    for L in L_list:
+        print(f"Running SDRG for L={L} with M={M} samples...")
+        J_ensemble = sample_couplings(L, M, dist_name, rng)
+        gaps = np.empty(M)
+
+        for s in range(M):
+            J_init = J_ensemble[s, :]
+            gap, _, _ = sdrg_single_chain(J_init, store_all_events=False)
+            gaps[s] = gap
+
+        gaps_list.append(gaps)
+
+    return gaps_list
+
+
+def plot_fisher_gap_scaling(L_list, gaps_list):
+    """
+    Plot the disorder-averaged -log(gap) vs sqrt(L) and fit a line.
+    """
+    plt.figure(figsize=(6,4))
+    
+    x_vals = []
+    y_vals = []
+
+    for L, gaps in zip(L_list, gaps_list):
+        # Filter out any zero or underflow gaps
+        good = gaps[gaps > 0]
+        avg_loggap = np.mean(-np.log(good))
+        
+        x_vals.append(np.sqrt(L))
+        y_vals.append(avg_loggap)
+        
+        plt.scatter(np.sqrt(L), avg_loggap, color='k')
+
+    # Fit y = a x + b
+    coef = np.polyfit(x_vals, y_vals, 1)
+    a, b = coef
+    xfit = np.linspace(0, max(x_vals), 200)
+    yfit = a*xfit + b
+    
+    plt.plot(xfit, yfit, '--r', label=f"fit slope={a:.3f}")
+
+    plt.xlabel(r"$\sqrt{L}$", fontsize=12)
+    plt.ylabel(r"$-\log \Delta_L$", fontsize=12)
+    plt.title("Fisher Activated Scaling of the Excitation Gap")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    
 # ---------- Minimal sanity check ----------
 
 if __name__ == "__main__":
-    L = 100
-    M = 500
+    
+    #-----------------------------------------------------------------------------------------
+    # this code runs an example of sdrg on heisenberg chains of length L over M iterations. It gives out all important observables. However for fisher_scaling 
+    #and length vs energy we still need to reduce the date to one single point per length. Tho the variance might be interesting to keep
+    
+    """
+    L = 300
+    M = 2000
     gaps, all_lengths, all_omegas, L0 = sdrg_ensemble(
-        L, M, dist_name="Uniform(0,1)", seed=123, store_all_events=True
+        L, M, dist_name="Uniform(0,1)", seed=0, store_all_events=True
     )
-    print("Gaps:", gaps)
-    print("Sample singlet lengths:", all_lengths[:10])
-    print("Sample Omegas:", all_omegas[:10])
+    
+    r_vals, C_r = avg_correlations_from_singlets(all_lengths, L0, M)
+    
     plot_gap_distribution(gaps)
+    plot_length_vs_energy(all_lengths, all_omegas)
+    plot_fisher_scaling(all_lengths, all_omegas)
+    plot_correlations(r_vals, C_r)
+    """
+    
+    
+    
+    #-------------------------------------------------------------------------------------------
+    #this code computes the infinite randomness fixpoint energy scaling for lowest energy excitation and compares it to the theoretical predictions of the fisher scaling
+    
+    L_list = [16, 32, 64, 96, 128, 192]
+    
+    # Number of samples per size
+    M = 500   # increase to 2000+ for publication-quality
+    
+    # Run scaling study
+    gaps_list = run_scaling_study(L_list, M, dist_name="Uniform(0,1)", seed=42)
+    
+    # Plot the activated scaling
+    plot_fisher_gap_scaling(L_list, gaps_list)
