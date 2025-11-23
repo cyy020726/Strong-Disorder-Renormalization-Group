@@ -143,9 +143,41 @@ def run_sdrg_with_logging(J_init):
 
     return gap, events, L0
 
+def run_ensemble(L, M, dist_name="Uniform(0,1)", seed=0):
+    rng = np.random.default_rng(seed)
+    J_ensemble = sample_couplings(L, M, dist_name, rng)
+
+    gaps = []
+    all_lengths = []
+    all_omegas = []
+
+    for s in range(M):
+        J_init = J_ensemble[s, :]
+        gap, events, L0 = run_sdrg_with_logging(J_init)
+        gaps.append(gap)
+
+        for Omega, i_site, j_site in events:
+            d = abs(j_site - i_site)
+            # periodic distance
+            d = min(d, L0 - d)
+            all_lengths.append(d)
+            all_omegas.append(Omega)
+
+    return np.array(gaps), np.array(all_lengths), np.array(all_omegas), L0
+
+
+def plot_length_vs_energy(all_lengths, all_omegas):
+    plt.figure()
+    plt.scatter(all_lengths, all_omegas, s=2, alpha=0.3)
+    plt.yscale("log")
+    plt.xlabel("singlet length ℓ")
+    plt.ylabel("decimation energy Ω")
+    plt.tight_layout()
+    plt.show()
+
 
 # ================================ GUI Class ===================================
-
+"""
 class SDRGEnsembleGUI:
     def __init__(self, master):
         self.master = master
@@ -341,9 +373,11 @@ class SDRGEnsembleGUI:
         self.canvas3d = None
         # Sync toggle with reality
         self.show_3d.set(False)
+        
+
 
     def on_toggle_3d(self):
-        """Handle turning 3D plot on/off."""
+        #Handle turning 3D plot on/off.
         if self.show_3d.get():
             # Turn ON: create window if needed and redraw
             if self.top3d is None:
@@ -947,7 +981,7 @@ class SDRGEnsembleGUI:
     # --------------------- RG flow plot update -------------------------
 
     def update_rg_plot(self, Omega):
-        """Update RG flow data and redraw the RG plot."""
+        # Update RG flow data and redraw the RG plot.
         # Update data arrays if we have a valid Omega and current J
         if self.J_current is not None and Omega is not None:
             if len(self.rg_steps) == 0 or self.rg_steps[-1] != self.step_count:
@@ -1151,3 +1185,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+
