@@ -362,13 +362,14 @@ if __name__ == "__main__":
     #-------------------------------------------------------------------------------------------
     #this code computes the infinite randomness fixpoint energy scaling for lowest energy excitation and compares it to the theoretical predictions of the fisher scaling
     
+    
     L_list = [16, 32, 64, 96, 128, 192]
     
     # Number of samples per size
     M = 500   # increase to 2000+ for publication-quality
     
     # Run scaling study
-    gaps_list = run_scaling_study(L_list, M, dist_name="Uniform(0,1)", seed=42)
+    gaps_list = run_scaling_study(L_list, M, dist_name="Abs Gaussian N(0,1)", seed=42)
     
     # Plot the activated scaling
     plot_fisher_gap_scaling(L_list, gaps_list)
