@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-SDRG ground-state viewer (batch mode only).
-
-- Sample an ensemble of random AFM chains (Heisenberg-like couplings).
-- Run SDRG down to the last bond for each sample:
-    - At each step, freeze the strongest bond into a singlet.
-    - Keep track of all singlets (pairs of original site indices).
-    - Track the last decimated (effective) bond energy as the "first excitation gap".
-- Main window:
-    - Top: ensemble singlet-based "correlation profile"
-      C(r) = -3/4 * (number of singlets at distance r) / N, where N is total #singlets.
-    - Bottom: histogram of the first excitation gaps across the ensemble.
-- Separate window:
-    - Visualizes singlet patterns for a selectable sample:
-      spins on a circle, singlets as straight chords.
-"""
-
 import numpy as np
 import tkinter as tk
 from tkinter import ttk
@@ -26,22 +8,22 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
-# ---------------------- Sampling distributions ---------------------- #
+# ============================================================
+# Sampling distributions (same variants as before + gamma, FD)
+# ============================================================
 
 def sample_fermi_dirac(shape, rng: np.random.Generator):
     """
-    Very simple rejection sampler for a toy 'Fermi-Dirac-like'
-    positive distribution, just to have another profile.
-    (Not a physically exact FD function; used only as a random profile.)
+    Rejection sampling for a simple Fermi–Dirac–like positive J.
+    Here we just create a broad-tailed positive distribution.
     """
     size = int(np.prod(shape))
     out = np.empty(size, dtype=float)
     i = 0
     while i < size:
-        # Exponential proposal
         x = rng.exponential(scale=1.0)
         u = rng.random()
-        # Toy "Fermi-like" acceptance probability
+        # "Fermi-like" acceptance probability in x
         p_accept = np.exp(x) / (np.exp(x) + 1.0)
         if u < p_accept:
             out[i] = x
@@ -51,10 +33,8 @@ def sample_fermi_dirac(shape, rng: np.random.Generator):
 
 def sample_couplings(L: int, M: int, dist_name: str, rng: np.random.Generator) -> np.ndarray:
     """
-    Sample an M×L array of couplings J_{sample, bond}.
-
-    We interpret J_row[i] as the coupling between site i and i+1 (mod L),
-    so this is a periodic chain.
+    Sample an M x L array of positive couplings J_{s,i} according
+    to a chosen distribution. Each row = one chain; each column = bond (periodic).
     """
     if dist_name == "Uniform(0,1)":
         J = rng.random((M, L))
@@ -69,40 +49,60 @@ def sample_couplings(L: int, M: int, dist_name: str, rng: np.random.Generator) -
     elif dist_name == "Fermi-Dirac(μ=0,T=1)":
         J = sample_fermi_dirac((M, L), rng)
     else:
-        # Fallback
         J = rng.random((M, L))
     return J
 
 
-# ---------------------- GUI class ---------------------- #
+# ============================================================
+# Main GUI class
+# ============================================================
 
 class SDRGGroundStateGUI:
     def __init__(self, master):
         self.master = master
-        master.title("SDRG ground-state viewer — singlet profile + gap distribution")
+        master.title("SDRG ground-state viewer — correlations & gaps")
 
-        # Ensemble data
-        self.J_init = None              # (M, L) array of initial couplings
-        self.singlets_per_sample = None # list of length M, each a list of (i,j) singlet pairs
-        self.C_avg = None               # C_avg[r] = -3/4 * (#singlets at distance r)/N
-        self.gaps = None                # array of length M: last decimated (effective) bond energy
+        # ---------------- State ----------------
+        self.mode_var = tk.StringVar(value="single")  # "single" or "batch"
+
+        self.J_init = None               # single-shot ensemble J (M x L)
+        self.singlets_per_sample = None  # list of lists of (i,j) per sample
+        self.C_avg = None                # averaged correlation C(r)
+        self.gaps = None                 # array of gaps per sample
         self.L = None
         self.M = None
 
-        # Progress / status
-        self.progressbar = None
+        # batch data: dict[L] -> {"gaps","singlets","C_avg","M"}
+        self.batch_data = {}
+        self.batch_L_list = []           # sorted list of L's
+        self.batch_current_L_index = 0   # index into batch_L_list
 
-        # Ground-state viewer (separate window)
+        # progress tracking
+        self.decim_total = 1
+        self.decim_done = 0
+        self.batch_total_sizes = 1
+
+        # Ground-state (singlet pattern) viewer window
         self.show_gs = tk.BooleanVar(value=False)
         self.gs_top = None
         self.fig_gs = None
         self.ax_gs = None
         self.canvas_gs = None
-        self.gs_slider = None
+        self.gs_sample_slider = None
         self.gs_sample_label = None
         self.gs_sample_index = 0
 
-        # Layout: main frame
+        # Gap-scaling fit window
+        self.scaling_top = None
+        self.scaling_fig = None
+        self.scaling_canvas = None
+
+        # Size slider (on main window) state
+        self.size_index = 0
+        self.size_slider_main = None
+        self.size_label_main = None
+
+        # ---------------- Layout ----------------
         main_frame = ttk.Frame(master)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -112,22 +112,54 @@ class SDRGGroundStateGUI:
         self.right_frame = ttk.Frame(main_frame)
         self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # ---- Controls on the left ---- #
-
+        # ------- Controls (left, top) -------
         control_frame = ttk.Frame(self.left_frame)
         control_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
 
-        ttk.Label(control_frame, text="Chain length L:").grid(row=0, column=0, sticky="w")
+        # Mode selection
+        ttk.Label(control_frame, text="Mode:").grid(row=0, column=0, sticky="w")
+        rb_single = ttk.Radiobutton(
+            control_frame, text="Single shot",
+            variable=self.mode_var, value="single",
+            command=self.on_mode_change
+        )
+        rb_single.grid(row=0, column=1, sticky="w")
+        rb_batch = ttk.Radiobutton(
+            control_frame, text="Batch",
+            variable=self.mode_var, value="batch",
+            command=self.on_mode_change
+        )
+        rb_batch.grid(row=0, column=2, sticky="w")
+
+        # Single-shot L, M
+        ttk.Label(control_frame, text="Chain length L (single):").grid(row=1, column=0, sticky="w")
         self.entry_L = ttk.Entry(control_frame, width=8)
         self.entry_L.insert(0, "32")
-        self.entry_L.grid(row=0, column=1, padx=4, pady=2)
+        self.entry_L.grid(row=1, column=1, padx=4, pady=2)
 
-        ttk.Label(control_frame, text="# samples M:").grid(row=0, column=2, sticky="w")
+        ttk.Label(control_frame, text="# samples M:").grid(row=1, column=2, sticky="w")
         self.entry_M = ttk.Entry(control_frame, width=8)
         self.entry_M.insert(0, "64")
-        self.entry_M.grid(row=0, column=3, padx=4, pady=2)
+        self.entry_M.grid(row=1, column=3, padx=4, pady=2)
 
-        ttk.Label(control_frame, text="Distribution:").grid(row=1, column=0, sticky="w")
+        # Batch L-range
+        ttk.Label(control_frame, text="L_min (batch):").grid(row=2, column=0, sticky="w")
+        self.entry_Lmin = ttk.Entry(control_frame, width=8)
+        self.entry_Lmin.insert(0, "16")
+        self.entry_Lmin.grid(row=2, column=1, padx=4, pady=2)
+
+        ttk.Label(control_frame, text="L_max (batch):").grid(row=2, column=2, sticky="w")
+        self.entry_Lmax = ttk.Entry(control_frame, width=8)
+        self.entry_Lmax.insert(0, "64")
+        self.entry_Lmax.grid(row=2, column=3, padx=4, pady=2)
+
+        ttk.Label(control_frame, text="L_step:").grid(row=2, column=4, sticky="w")
+        self.entry_Lstep = ttk.Entry(control_frame, width=6)
+        self.entry_Lstep.insert(0, "16")
+        self.entry_Lstep.grid(row=2, column=5, padx=4, pady=2)
+
+        # Distribution & seed
+        ttk.Label(control_frame, text="Distribution:").grid(row=3, column=0, sticky="w")
         self.combo_dist = ttk.Combobox(
             control_frame,
             values=[
@@ -142,46 +174,64 @@ class SDRGGroundStateGUI:
             state="readonly"
         )
         self.combo_dist.current(0)
-        self.combo_dist.grid(row=1, column=1, columnspan=3, padx=4, pady=2, sticky="w")
+        self.combo_dist.grid(row=3, column=1, columnspan=3, padx=4, pady=2, sticky="w")
 
-        ttk.Label(control_frame, text="Seed:").grid(row=1, column=4, sticky="w")
+        ttk.Label(control_frame, text="Seed:").grid(row=3, column=4, sticky="w")
         self.entry_seed = ttk.Entry(control_frame, width=8)
         self.entry_seed.insert(0, "0")
-        self.entry_seed.grid(row=1, column=5, padx=4, pady=2)
+        self.entry_seed.grid(row=3, column=5, padx=4, pady=2)
 
-        ttk.Label(control_frame, text="# bins (gap hist):").grid(row=2, column=0, sticky="w")
+        # Histogram bins for gap distribution
+        ttk.Label(control_frame, text="# bins (gap hist):").grid(row=4, column=0, sticky="w")
         self.entry_bins = ttk.Entry(control_frame, width=6)
         self.entry_bins.insert(0, "20")
-        self.entry_bins.grid(row=2, column=1, padx=4, pady=2)
+        self.entry_bins.grid(row=4, column=1, padx=4, pady=2)
 
-        # We keep an entry for distance but only for potential extension; unused in hist now.
-        ttk.Label(control_frame, text="(distance entry unused)").grid(row=2, column=2, columnspan=2, sticky="w")
-
-        # Toggle for ground-state viewer window
+        # Ground-state viewer toggle
         self.check_gs = ttk.Checkbutton(
             control_frame,
-            text="Show ground-state viewer",
+            text="Show singlet viewer",
             variable=self.show_gs,
             command=self.on_toggle_gs
         )
-        self.check_gs.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 2))
+        self.check_gs.grid(row=4, column=2, columnspan=2, sticky="w", pady=(4, 2))
 
         # Buttons
-        self.button_sample = ttk.Button(control_frame, text="Sample ensemble", command=self.on_sample)
-        self.button_sample.grid(row=4, column=0, padx=2, pady=4, sticky="ew")
+        self.button_sample = ttk.Button(control_frame, text="Sample ensemble (single)", command=self.on_sample)
+        self.button_sample.grid(row=5, column=0, padx=2, pady=4, sticky="ew")
 
-        self.button_run = ttk.Button(control_frame, text="Run SDRG to GS", command=self.on_run_sdrg)
-        self.button_run.grid(row=4, column=1, padx=2, pady=4, sticky="ew")
+        self.button_run = ttk.Button(control_frame, text="Run SDRG (compute)", command=self.on_run_sdrg)
+        self.button_run.grid(row=5, column=1, padx=2, pady=4, sticky="ew")
 
-        # Status + progress bar
+        # ------- Progress + size slider -------
         self.status_label = ttk.Label(self.left_frame, text="Status: ready")
         self.status_label.pack(side=tk.TOP, anchor="w", pady=(4, 2))
 
+        self.decim_label = ttk.Label(self.left_frame, text="Decimation progress: 0 / 0 bonds")
+        self.decim_label.pack(side=tk.TOP, anchor="w")
         self.progressbar = ttk.Progressbar(self.left_frame, orient="horizontal", length=260, mode="determinate")
         self.progressbar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 5))
 
-        # ---- Correlation / gap plots on the right ---- #
+        self.batch_label = ttk.Label(self.left_frame, text="Batch progress: 0 / 0 sizes")
+        self.batch_label.pack(side=tk.TOP, anchor="w")
+        self.batch_progressbar = ttk.Progressbar(self.left_frame, orient="horizontal", length=260, mode="determinate")
+        self.batch_progressbar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 5))
 
+        # NEW: size slider on main window
+        self.size_label_main = ttk.Label(self.left_frame, text="Size index (batch): 0")
+        self.size_label_main.pack(side=tk.TOP, anchor="w", pady=(4, 0))
+        self.size_slider_main = tk.Scale(
+            self.left_frame,
+            from_=0,
+            to=0,
+            orient=tk.HORIZONTAL,
+            resolution=1,
+            showvalue=True,
+            command=self.on_size_slider_main_change
+        )
+        self.size_slider_main.pack(side=tk.TOP, fill=tk.X, padx=5, pady=(0, 5))
+
+        # ------- Correlation & gap plots (right) -------
         self.fig_corr = plt.Figure(figsize=(8, 6))
         gs = self.fig_corr.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.35)
         self.ax_corr_avg = self.fig_corr.add_subplot(gs[0, 0])
@@ -191,23 +241,51 @@ class SDRGGroundStateGUI:
         self.canvas_corr_widget = self.canvas_corr.get_tk_widget()
         self.canvas_corr_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # Initial state
+        self.on_mode_change()
         self.update_corr_plots()
 
-        # Dummy entry_dist just to keep compatibility with earlier layout (not used)
-        self.entry_dist = ttk.Entry(control_frame, width=6)
-        self.entry_dist.insert(0, "1")
-        self.entry_dist.grid_remove()  # hide it
+    # ====================================================
+    # Mode switching / sampling / running SDRG
+    # ====================================================
 
-    # ---------------------- Sampling + SDRG ---------------------- #
+    def on_mode_change(self):
+        """Enable/disable controls depending on mode."""
+        mode = self.mode_var.get()
+        if mode == "single":
+            self.status_label.config(text="Status: single-shot mode selected")
+
+            self.entry_L.config(state="normal")
+            self.button_sample.config(state="normal")
+
+            self.entry_Lmin.config(state="disabled")
+            self.entry_Lmax.config(state="disabled")
+            self.entry_Lstep.config(state="disabled")
+        else:
+            self.status_label.config(text="Status: batch mode selected (sampling done inside 'Run SDRG')")
+
+            self.entry_L.config(state="disabled")
+            self.button_sample.config(state="disabled")
+
+            self.entry_Lmin.config(state="normal")
+            self.entry_Lmax.config(state="normal")
+            self.entry_Lstep.config(state="normal")
+
+        self.update_size_slider_range()
+        self.update_sample_slider_range()
+        self.update_gs_viewer()
 
     def on_sample(self):
-        """Sample a new ensemble of random couplings."""
+        """Sample an ensemble in single-shot mode."""
+        if self.mode_var.get() == "batch":
+            self.status_label.config(text="Status: in batch mode, sampling is done inside 'Run SDRG (compute)'")
+            return
+
         try:
             L = int(self.entry_L.get())
             M = int(self.entry_M.get())
             seed = int(self.entry_seed.get())
             if L <= 1 or M <= 0 or L % 2 != 0:
-                # We want even L so that L/2 singlets per chain is natural.
                 raise ValueError
         except ValueError:
             self.status_label.config(text="Status: invalid L or M (L must be even, L>1, M>0)")
@@ -215,28 +293,47 @@ class SDRGGroundStateGUI:
 
         self.L = L
         self.M = M
-
         dist_name = self.combo_dist.get()
         rng = np.random.default_rng(seed)
         self.J_init = sample_couplings(L, M, dist_name, rng)
 
-        # Reset SDRG-derived data
+        # Reset SDRG-related data
         self.singlets_per_sample = None
         self.C_avg = None
         self.gaps = None
 
+        # Reset progress bars
+        self.decim_total = 0
+        self.decim_done = 0
         self.progressbar['mode'] = 'determinate'
         self.progressbar['maximum'] = 1
         self.progressbar['value'] = 0
+        self.decim_label.config(text="Decimation progress: 0 / 0 bonds")
 
-        self.status_label.config(text="Status: ensemble sampled (no SDRG yet)")
+        self.batch_total_sizes = 0
+        self.batch_progressbar['mode'] = 'determinate'
+        self.batch_progressbar['maximum'] = 1
+        self.batch_progressbar['value'] = 0
+        self.batch_label.config(text="Batch progress: 0 / 0 sizes")
+
+        # Size slider (single-shot: disabled; just show L)
+        self.size_index = 0
+        self.update_size_slider_range()
+
+        self.status_label.config(text="Status: ensemble sampled (single-shot, no SDRG yet)")
         self.update_corr_plots()
         self.update_gs_viewer()
 
     def on_run_sdrg(self):
-        """Run SDRG down to the last bond for all samples (batch mode)."""
+        if self.mode_var.get() == "single":
+            self.on_run_sdrg_single()
+        else:
+            self.on_run_sdrg_batch()
+
+    def on_run_sdrg_single(self):
+        """Run SDRG once for the current single-shot ensemble."""
         if self.J_init is None:
-            self.status_label.config(text="Status: sample ensemble first")
+            self.status_label.config(text="Status: sample ensemble first (single-shot)")
             return
         L = self.L
         M = self.M
@@ -244,70 +341,168 @@ class SDRGGroundStateGUI:
             self.status_label.config(text="Status: internal error (L,M)")
             return
 
-        # Each chain of length L (even) eventually yields L/2 singlets.
-        # Total decimations ~ M * (L/2).
-        est_max_decim = M * (L // 2)
-        if est_max_decim <= 0:
-            est_max_decim = 1
-        self.progressbar['mode'] = 'determinate'
-        self.progressbar['maximum'] = est_max_decim
-        self.progressbar['value'] = 0
-
-        self.status_label.config(text="Status: running SDRG...")
+        self.status_label.config(text="Status: running SDRG (single-shot)...")
         self.master.update_idletasks()
 
-        singlets_all = []
-        gaps_all = []
-        decim_done = 0
+        singlets_all, gaps_all = self.run_sdrg_ensemble(self.J_init, L)
+        self.singlets_per_sample = singlets_all
+        self.gaps = gaps_all
+        self.C_avg = self.compute_C_from_singlets(singlets_all, L, M)
 
-        for s in range(M):
-            J_row = self.J_init[s, :]
-            singlets_s, gap_s = self.run_sdrg_single_chain(J_row, L)
-            singlets_all.append(singlets_s)
-            gaps_all.append(gap_s)
-            decim_done += len(singlets_s)
-            if decim_done > est_max_decim:
-                decim_done = est_max_decim
-            self.progressbar['value'] = decim_done
+        self.status_label.config(text="Status: SDRG complete (single-shot)")
+
+        self.update_corr_plots()
+        self.update_size_slider_range()
+        self.update_sample_slider_range()
+        self.update_gs_viewer()
+
+    def on_run_sdrg_batch(self):
+        """Run SDRG for many sizes L and build scaling plot."""
+        try:
+            Lmin = int(self.entry_Lmin.get())
+            Lmax = int(self.entry_Lmax.get())
+            Lstep = int(self.entry_Lstep.get())
+            M = int(self.entry_M.get())
+            seed = int(self.entry_seed.get())
+            if Lmin < 2 or Lmax < 2 or Lmax < Lmin or Lstep <= 0 or M <= 0:
+                raise ValueError
+        except ValueError:
+            self.status_label.config(text="Status: invalid batch parameters")
+            return
+
+        dist_name = self.combo_dist.get()
+
+        # Build list of even sizes
+        L_list = []
+        L_cur = Lmin
+        while L_cur <= Lmax:
+            if L_cur % 2 != 0:
+                L_cur += 1
+            if L_cur < 2:
+                L_cur = 2
+            L_list.append(L_cur)
+            L_cur += Lstep
+        L_list = sorted(set(L_list))
+        if not L_list:
+            self.status_label.config(text="Status: no valid system sizes for batch")
+            return
+
+        self.status_label.config(text="Status: running SDRG (batch mode)...")
+        self.master.update_idletasks()
+
+        self.batch_data = {}
+        self.batch_L_list = list(L_list)
+        self.batch_current_L_index = 0
+
+        # Batch progress bar
+        self.batch_total_sizes = len(L_list)
+        self.batch_progressbar['mode'] = 'determinate'
+        self.batch_progressbar['maximum'] = self.batch_total_sizes
+        self.batch_progressbar['value'] = 0
+        self.batch_label.config(text=f"Batch progress: 0 / {self.batch_total_sizes} sizes")
+
+        rng = np.random.default_rng(seed)
+        scaling_x = []
+        scaling_y = []
+
+        for idx_L, L in enumerate(L_list):
+            J_ensemble = sample_couplings(L, M, dist_name, rng)
+            singlets_all, gaps_all = self.run_sdrg_ensemble(J_ensemble, L)
+            C_avg_L = self.compute_C_from_singlets(singlets_all, L, M)
+
+            self.batch_data[L] = {
+                "gaps": gaps_all,
+                "singlets": singlets_all,
+                "C_avg": C_avg_L,
+                "M": M,
+            }
+
+            gaps_pos = gaps_all[gaps_all > 0]
+            if gaps_pos.size > 0:
+                avg_loggap = np.mean(-np.log(gaps_pos))
+                scaling_x.append(np.sqrt(L))
+                scaling_y.append(avg_loggap)
+
+            self.batch_progressbar['value'] = idx_L + 1
+            self.batch_label.config(
+                text=f"Batch progress: {idx_L + 1} / {self.batch_total_sizes} sizes"
+            )
             self.master.update_idletasks()
 
-        # Snap bar to full at the end
-        if decim_done < est_max_decim:
-            self.progressbar['value'] = est_max_decim
+        # After batch computation: enable size slider and set to index 0
+        self.size_index = 0
+        self.size_slider_main.config(state="normal")
+        self.size_slider_main.config(from_=0, to=len(self.batch_L_list) - 1)
+        self.size_slider_main.set(0)
+        self.update_size_slider_range()
+        # This will also set active size, update plots and GS viewer
+        self.on_size_slider_main_change("0")
 
-        self.singlets_per_sample = singlets_all
-        self.gaps = np.array(gaps_all, dtype=float)
-        self.status_label.config(text="Status: SDRG complete (ground-state singlets + gaps stored)")
+        self.status_label.config(text="Status: batch SDRG complete")
 
-        # Compute ensemble-averaged correlation profile from singlet distances
-        self.compute_correlations()
-        self.update_corr_plots()
-        self.update_gs_viewer()
+        # Open scaling window
+        if len(scaling_x) >= 2:
+            self.create_scaling_window(np.array(scaling_x), np.array(scaling_y))
+
+    # ====================================================
+    # SDRG core routines
+    # ====================================================
+
+    def run_sdrg_ensemble(self, J_ensemble, L):
+        """
+        Run SDRG for each row in J_ensemble (shape M x L).
+        Return list of singlet lists and array of gaps.
+        """
+        M = J_ensemble.shape[0]
+        singlets_all = []
+        gaps_all = np.empty(M, dtype=float)
+
+        # Total decimations in all chains: each chain produces L/2 singlets
+        self.decim_total = M * (L // 2)
+        if self.decim_total <= 0:
+            self.decim_total = 1
+        self.decim_done = 0
+        self.progressbar['mode'] = 'determinate'
+        self.progressbar['maximum'] = self.decim_total
+        self.progressbar['value'] = 0
+        self.decim_label.config(
+            text=f"Decimation progress: 0 / {self.decim_total} bonds"
+        )
+
+        for s in range(M):
+            J_row = J_ensemble[s, :]
+            singlets_s, gap_s = self.run_sdrg_single_chain(J_row, L)
+            singlets_all.append(singlets_s)
+            gaps_all[s] = gap_s
+
+            self.decim_done += len(singlets_s)
+            if self.decim_done > self.decim_total:
+                self.decim_done = self.decim_total
+            self.progressbar['value'] = self.decim_done
+            self.decim_label.config(
+                text=f"Decimation progress: {self.decim_done} / {self.decim_total} bonds"
+            )
+            self.master.update_idletasks()
+
+        return singlets_all, gaps_all
 
     def run_sdrg_single_chain(self, J_row, L):
         """
-        Run SDRG for one chain (one sample) until no bonds remain.
-
-        Representation:
-        - Nodes: original sites {0,...,L-1}, we never relabel them.
-        - Edges: dict mapping frozenset({i,j}) -> J_ij > 0.
-        - Neighbors: adjacency sets.
-
-        At each step:
-        - Find edge with max J_ij.
-        - Record singlet (i,j).
-        - Find the remaining neighbors k of i and l of j (if any).
-        - Generate effective coupling J_eff = J_ik J_jl / (2 J_ij) between k and l (if both exist).
-        - Remove i and j and all incident edges.
+        Graph-like SDRG for one chain:
+        - Bonds connect sites i and (i+1) mod L.
+        - At each step, pick max J, record a singlet between its sites,
+          generate an effective coupling between one neighbor of i and one of j,
+          then remove i and j from the graph.
 
         Returns:
-            singlets: list of (i,j) singlet pairs
-            final_gap: the last decimated J_max (first excitation gap scale)
+          singlets: list of (i,j) original site indices
+          gap: minimum RG scale (smallest Omega seen)
         """
+        # Build initial edges and neighbor lists
         edges = {}
         neighbors = {i: set() for i in range(L)}
 
-        # Build initial periodic chain edges from J_row
+        # Bonds i-(i+1)
         for i in range(L):
             j = (i + 1) % L
             Jval = float(J_row[i])
@@ -319,16 +514,21 @@ class SDRGGroundStateGUI:
             neighbors[j].add(i)
 
         singlets = []
-        final_gap = 0.0  # default in case edges is empty
+        min_Omega = np.inf
 
+        # Keep decimating until no edges remain
         while edges:
-            # Pick the strongest bond
+            # Find strongest bond
             key_max, J_max = max(edges.items(), key=lambda kv: kv[1])
             i, j = tuple(key_max)
-            singlets.append((i, j))
-            final_gap = float(J_max)  # update the last decimated energy scale
+            Omega = float(J_max)
 
-            # Neighbors excluding each other
+            # Record singlet
+            singlets.append((i, j))
+            if Omega < min_Omega:
+                min_Omega = Omega
+
+            # Neighbors of i and j (excluding each other)
             nei_i = set(neighbors.get(i, set()))
             if j in nei_i:
                 nei_i.remove(j)
@@ -336,7 +536,7 @@ class SDRGGroundStateGUI:
             if i in nei_j:
                 nei_j.remove(i)
 
-            # Generate effective bond between k and l if both have external neighbors
+            # Generate an effective coupling between some neighbor of i and some neighbor of j
             if len(nei_i) > 0 and len(nei_j) > 0:
                 k = next(iter(nei_i))
                 l = next(iter(nei_j))
@@ -353,7 +553,7 @@ class SDRGGroundStateGUI:
                         neighbors.setdefault(k, set()).add(l)
                         neighbors.setdefault(l, set()).add(k)
 
-            # Remove i and j, along with all incident edges
+            # Remove all edges involving i or j
             for n in list(neighbors.get(i, set())):
                 key = frozenset((i, n))
                 edges.pop(key, None)
@@ -362,51 +562,48 @@ class SDRGGroundStateGUI:
                 key = frozenset((j, n))
                 edges.pop(key, None)
                 neighbors[n].discard(j)
-
             neighbors.pop(i, None)
             neighbors.pop(j, None)
 
-        return singlets, final_gap
+        gap = float(min_Omega) if np.isfinite(min_Omega) else 0.0
+        return singlets, gap
 
-    # ---------------------- Correlation computation ---------------------- #
+    # ====================================================
+    # Derived observables: C(r) and gap histogram
+    # ====================================================
 
-    def compute_correlations(self):
+    def compute_C_from_singlets(self, singlets_per_sample, L, M):
         """
-        From the singlet structure across the ensemble, compute:
+        From singlets (i,j) in each sample, compute
+        C(r) = -3/4 * P_singlet(r), where P_singlet(r)
+        is probability that a pair at distance r is a singlet.
 
-        C_avg[r] = -3/4 * (number of singlet pairs at distance r) / N,
-
-        where distance r is the minimal distance on the ring, and
-        N is the total number of singlet pairs across all samples.
+        We approximate P_singlet(r) by counting singlets at distance r
+        and dividing by M*L (total number of (i,i+r) pairs on a ring).
         """
-        if self.singlets_per_sample is None or self.L is None or self.M is None:
-            self.C_avg = None
-            return
+        if singlets_per_sample is None or L is None or M is None:
+            return None
 
-        L = self.L
         d_max = L // 2
         if d_max < 1:
-            self.C_avg = None
-            return
+            return None
 
         counts = np.zeros(d_max + 1, dtype=int)
-        total_pairs = 0
 
-        for singlets in self.singlets_per_sample:
-            total_pairs += len(singlets)
+        for singlets in singlets_per_sample:
             for (i, j) in singlets:
                 dx = abs(i - j)
                 d = min(dx, L - dx)
-                if 1 <= d <= d_max:
+                if 0 <= d <= d_max:
                     counts[d] += 1
 
+        total_pairs = M * L
         C_avg = np.zeros(d_max + 1, dtype=float)
         if total_pairs > 0:
-            C_avg = -0.75 * counts / float(total_pairs)
+            P_r = counts / float(total_pairs)
+            C_avg = -0.75 * P_r
 
-        self.C_avg = C_avg
-
-    # ---------------------- Correlation / gap plots ---------------------- #
+        return C_avg
 
     def get_hist_bins(self):
         try:
@@ -418,66 +615,84 @@ class SDRGGroundStateGUI:
         return nb
 
     def update_corr_plots(self):
-        """Refresh both plots in the main window."""
+        """Update the correlation plot (top) and gap histogram (bottom)."""
         self.ax_corr_avg.clear()
         self.ax_corr_hist.clear()
 
         if self.C_avg is None or self.L is None or self.gaps is None:
-            # No data yet
             self.ax_corr_avg.set_title("Singlet-based correlation profile (no data)")
-            self.ax_corr_avg.set_xlabel("|i - j| (minimal distance on ring)")
-            self.ax_corr_avg.set_ylabel("C(r) = -3/4 · (singlets at distance r) / N")
+            self.ax_corr_avg.set_xlabel("distance r")
+            self.ax_corr_avg.set_ylabel("-C(r)")
 
             self.ax_corr_hist.set_title("Gap distribution (no data)")
-            self.ax_corr_hist.set_xlabel("gap (last J_eff)")
-            self.ax_corr_hist.set_ylabel("count")
+            self.ax_corr_hist.set_xlabel(r"$-\log \Delta$")
+            self.ax_corr_hist.set_ylabel("probability density")
 
             self.fig_corr.tight_layout()
             self.canvas_corr.draw_idle()
             return
 
+        # --- Correlation plot: log-log, compare to 1/r^2 ---
         L = self.L
         d_max = L // 2
-        distances = np.arange(1, d_max + 1)
-        y = self.C_avg[1:d_max + 1]
+        distances = np.arange(0, d_max + 1)
+        y = self.C_avg
 
-        # Top plot: C(r) vs distance
-        self.ax_corr_avg.plot(distances, y, marker='o', linestyle='-')
-        self.ax_corr_avg.set_xlabel("|i - j| along chain (minimal on ring)")
-        self.ax_corr_avg.set_ylabel("C(r) = -3/4 · (singlets at distance r) / N")
-        self.ax_corr_avg.set_title("Ensemble singlet-based 'correlation' profile")
+        r_plot = distances[1:]          # skip r=0
+        C_plot = -y[1:]                 # >0 for plotting
+        mask = C_plot > 0
+        r_plot = r_plot[mask]
+        C_plot = C_plot[mask]
 
-        # Bottom plot: histogram of first excitation gaps
+        if r_plot.size > 0:
+            self.ax_corr_avg.loglog(r_plot, C_plot, "o-", label="SDRG", markersize=4)
+            theory = 1.0 / (r_plot ** 2)
+            scale_factor = C_plot[0] / theory[0]
+            theory_scaled = theory * scale_factor
+            self.ax_corr_avg.loglog(r_plot, theory_scaled, "--", label="∝ 1/r^2 (rescaled)")
+            self.ax_corr_avg.set_xlabel("distance r")
+            self.ax_corr_avg.set_ylabel("-C(r)")
+            self.ax_corr_avg.set_title("Log–log average spin correlations from SDRG")
+            self.ax_corr_avg.legend()
+        else:
+            self.ax_corr_avg.set_title("Singlet-based correlation profile (no nonzero C(r))")
+            self.ax_corr_avg.set_xlabel("distance r")
+            self.ax_corr_avg.set_ylabel("-C(r)")
+
+        # --- Gap distribution: histogram of -log(Δ) with log y-axis ---
         gaps = self.gaps
         gaps_pos = gaps[gaps > 0]
         nb = self.get_hist_bins()
 
         if gaps_pos.size == 0:
             self.ax_corr_hist.set_title("Gap distribution (no positive gaps)")
-            self.ax_corr_hist.set_xlabel("gap (last J_eff)")
-            self.ax_corr_hist.set_ylabel("count")
+            self.ax_corr_hist.set_xlabel(r"$-\log \Delta$")
+            self.ax_corr_hist.set_ylabel("probability density")
         else:
-            g_min = float(gaps_pos.min())
-            g_max = float(gaps_pos.max())
+            g_log = -np.log(gaps_pos)
+            g_min = float(g_log.min())
+            g_max = float(g_log.max())
             if g_max == g_min:
-                g_min -= 0.5 * abs(g_min) if g_min != 0 else -0.5
-                g_max += 0.5 * abs(g_max) if g_max != 0 else 0.5
+                g_min = g_min - 0.5 if g_min != 0 else -0.5
+                g_max = g_max + 0.5 if g_max != 0 else 0.5
+
             self.ax_corr_hist.hist(
-                gaps_pos,
+                g_log,
                 bins=nb,
                 range=(g_min, g_max),
+                density=True,          # empirical density
                 edgecolor='black',
                 alpha=0.7
             )
-            self.ax_corr_hist.set_xlabel("First excitation gap (last J_eff)")
-            self.ax_corr_hist.set_ylabel("count")
-            self.ax_corr_hist.set_title("Distribution of first excitation gaps across ensemble")
+            self.ax_corr_hist.set_xlabel(r"$-\log \Delta$  (with $\Delta = \mathrm{gap}$)")
+            self.ax_corr_hist.set_ylabel("probability density")
+            self.ax_corr_hist.set_yscale("log")
+            self.ax_corr_hist.set_title(r"Distribution of $-\log \Delta$ across ensemble")
 
-            # Annotate mean gap
             mean_gap = float(np.mean(gaps_pos))
             self.ax_corr_hist.text(
                 0.98, 0.95,
-                f"mean gap ≈ {mean_gap:.3g}",
+                f"⟨Δ⟩ ≈ {mean_gap:.3g}",
                 transform=self.ax_corr_hist.transAxes,
                 ha='right',
                 va='top',
@@ -488,24 +703,72 @@ class SDRGGroundStateGUI:
         self.fig_corr.tight_layout()
         self.canvas_corr.draw_idle()
 
-    # ---------------------- Ground-state viewer window ---------------------- #
+    # ====================================================
+    # Gap scaling window (batch mode)
+    # ====================================================
+
+    def create_scaling_window(self, x_vals, y_vals):
+        """
+        x_vals ~ sqrt(L), y_vals ~ ⟨-log gap⟩_disorder.
+        Plot and fit y = a x + b.
+        """
+        mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+        x = x_vals[mask]
+        y = y_vals[mask]
+        if x.size < 2:
+            return
+
+        a, b = np.polyfit(x, y, 1)
+        xfit = np.linspace(0, float(x.max()), 200)
+        yfit = a * xfit + b
+
+        if self.scaling_top is not None:
+            try:
+                self.scaling_top.destroy()
+            except Exception:
+                pass
+
+        self.scaling_top = tk.Toplevel(self.master)
+        self.scaling_top.title("Gap scaling: ⟨-log Δ_L⟩ vs √L")
+
+        self.scaling_fig = plt.Figure(figsize=(6, 4))
+        ax = self.scaling_fig.add_subplot(111)
+
+        ax.scatter(x, y, color='k', label="data")
+        ax.plot(xfit, yfit, '--r', label=f"fit slope = {a:.3f}")
+        ax.set_xlabel(r"$\sqrt{L}$")
+        ax.set_ylabel(r"$\langle -\log \Delta_L \rangle$")
+        ax.set_title("Fisher-like activated scaling of the excitation gap")
+        ax.legend()
+
+        self.scaling_fig.tight_layout()
+        self.scaling_canvas = FigureCanvasTkAgg(self.scaling_fig, master=self.scaling_top)
+        widget = self.scaling_canvas.get_tk_widget()
+        widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.scaling_canvas.draw_idle()
+
+    # ====================================================
+    # Ground-state (singlet) viewer window
+    # ====================================================
 
     def on_toggle_gs(self):
-        """Open/close the ground-state viewer window."""
+        """Show/hide the ground-state singlet viewer window."""
         if self.show_gs.get():
             if self.gs_top is None:
                 self.create_gs_window()
+            self.update_sample_slider_range()
             self.update_gs_viewer()
         else:
             if self.gs_top is not None:
                 self.on_close_gs()
 
     def create_gs_window(self):
-        """Create the separate window that shows singlet patterns per sample."""
+        """Create the singlet viewer window (one slider: sample index)."""
         if self.gs_top is not None:
             return
+
         self.gs_top = tk.Toplevel(self.master)
-        self.gs_top.title("SDRG ground-state singlet patterns (per sample)")
+        self.gs_top.title("SDRG ground-state singlet patterns (per sample / size)")
 
         fig_frame = ttk.Frame(self.gs_top)
         fig_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -519,57 +782,149 @@ class SDRGGroundStateGUI:
         self.canvas_gs_widget = self.canvas_gs.get_tk_widget()
         self.canvas_gs_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Slider for sample index
+        # Only sample slider now
         slider_frame = ttk.Frame(self.gs_top)
         slider_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        slider_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(slider_frame, text="Sample index:").pack(side=tk.LEFT)
-        max_index = max(0, (self.M or 1) - 1)
-        self.gs_slider = tk.Scale(
+        ttk.Label(slider_frame, text="Sample index:").grid(row=0, column=0, sticky="w")
+        self.gs_sample_slider = tk.Scale(
             slider_frame,
             from_=0,
-            to=max_index,
+            to=0,
             orient=tk.HORIZONTAL,
             resolution=1,
             showvalue=True,
-            command=self.on_gs_slider_change
+            command=self.on_gs_sample_slider_change
         )
-        self.gs_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.gs_sample_slider.grid(row=0, column=1, sticky="ew", padx=5)
+
         self.gs_sample_label = ttk.Label(slider_frame, text="(no data)")
-        self.gs_sample_label.pack(side=tk.LEFT, padx=5)
+        self.gs_sample_label.grid(row=1, column=0, columnspan=2, sticky="e")
 
         self.gs_top.protocol("WM_DELETE_WINDOW", self.on_close_gs)
 
     def on_close_gs(self):
-        """Handle closing the ground-state viewer window."""
+        """Handle closing the singlet viewer window."""
         try:
             if self.gs_top is not None:
                 self.gs_top.destroy()
         except Exception:
             pass
+
         self.gs_top = None
         self.fig_gs = None
         self.ax_gs = None
         self.canvas_gs = None
-        self.gs_slider = None
+        self.gs_sample_slider = None
         self.gs_sample_label = None
         self.show_gs.set(False)
 
-    def on_gs_slider_change(self, value):
-        """Callback when the sample index slider changes."""
+    # ---- Size slider (main window) and sample slider (GS window) ----
+
+    def update_size_slider_range(self):
+        """Configure main-window size slider depending on mode and data."""
+        if self.size_slider_main is None:
+            return
+
+        mode = self.mode_var.get()
+        if mode == "batch" and self.batch_L_list:
+            max_idx = len(self.batch_L_list) - 1
+            self.size_slider_main.config(state="normal", from_=0, to=max_idx)
+            idx = max(0, min(self.size_index, max_idx))
+            self.size_index = idx
+            self.size_slider_main.set(idx)
+            L = self.batch_L_list[idx]
+            self.size_label_main.config(text=f"Size index (batch): {idx} (L={L})")
+        elif mode == "single" and self.L is not None:
+            # Single-shot: slider disabled, but show L
+            self.size_slider_main.config(state="disabled", from_=0, to=0)
+            self.size_slider_main.set(0)
+            self.size_index = 0
+            self.size_label_main.config(text=f"Size index (single): 0 (L={self.L})")
+        else:
+            # No data yet
+            self.size_slider_main.config(state="disabled", from_=0, to=0)
+            self.size_slider_main.set(0)
+            self.size_index = 0
+            self.size_label_main.config(text="Size index: 0")
+
+    def update_sample_slider_range(self):
+        """Configure the sample slider in the GS window."""
+        if self.gs_sample_slider is None:
+            return
+
+        if self.M is not None and self.M > 0:
+            max_s = self.M - 1
+            self.gs_sample_slider.config(state="normal", from_=0, to=max_s)
+            idx = max(0, min(self.gs_sample_index, max_s))
+            self.gs_sample_index = idx
+            self.gs_sample_slider.set(idx)
+        else:
+            self.gs_sample_slider.config(state="disabled", from_=0, to=0)
+            self.gs_sample_slider.set(0)
+            self.gs_sample_index = 0
+
+    def on_size_slider_main_change(self, value):
+        """When user moves the size slider in batch mode, switch to that L."""
         try:
             idx = int(float(value))
         except ValueError:
             idx = 0
-        if self.M is not None:
+        self.size_index = idx
+
+        if self.mode_var.get() == "batch":
+            self.set_active_size_index(idx)
+            self.update_corr_plots()
+            self.update_sample_slider_range()
+            self.update_gs_viewer()
+        else:
+            # In single-shot mode, the size slider is disabled and this shouldn't be triggered
+            pass
+
+    def on_gs_sample_slider_change(self, value):
+        """When user moves the sample slider, update singlet drawing."""
+        try:
+            idx = int(float(value))
+        except ValueError:
+            idx = 0
+
+        if self.M is not None and self.M > 0:
             idx = max(0, min(idx, self.M - 1))
         else:
             idx = 0
+
         self.gs_sample_index = idx
+        self.update_sample_slider_range()
         self.update_gs_viewer()
 
+    def set_active_size_index(self, idx):
+        """
+        In batch mode: pick which L (index in batch_L_list) is active.
+        This sets L, M, singlets_per_sample, C_avg, gaps, so the
+        main plots and GS viewer can use them.
+        """
+        if self.mode_var.get() != "batch":
+            return
+        if not self.batch_L_list:
+            return
+
+        idx = max(0, min(idx, len(self.batch_L_list) - 1))
+        self.batch_current_L_index = idx
+
+        L = self.batch_L_list[idx]
+        data = self.batch_data.get(L)
+        if data is None:
+            return
+
+        self.L = L
+        self.M = data.get("M", len(data["singlets"]))
+        self.singlets_per_sample = data["singlets"]
+        self.C_avg = data["C_avg"]
+        self.gaps = data["gaps"]
+
     def update_gs_viewer(self):
-        """Redraw the singlet pattern for the currently selected sample."""
+        """Redraw the singlet picture (if the GS window is open)."""
         if not self.show_gs.get() or self.gs_top is None or self.ax_gs is None:
             return
 
@@ -579,7 +934,8 @@ class SDRGGroundStateGUI:
 
         if self.L is None:
             self.fig_gs.tight_layout()
-            self.canvas_gs.draw_idle()
+            if self.canvas_gs is not None:
+                self.canvas_gs.draw_idle()
             return
 
         L = self.L
@@ -587,10 +943,8 @@ class SDRGGroundStateGUI:
         x = np.cos(theta)
         y = np.sin(theta)
 
-        # Draw sites as dots
+        # Draw sites on circle
         self.ax_gs.scatter(x, y, s=20, c='k')
-
-        # Label site indices around the circle
         for i in range(L):
             self.ax_gs.text(
                 x[i] * 1.08, y[i] * 1.08,
@@ -603,12 +957,13 @@ class SDRGGroundStateGUI:
         if self.singlets_per_sample is None or self.M is None:
             self.ax_gs.set_title("No ground-state singlets computed yet.")
         else:
-            s = max(0, min(self.gs_sample_index, self.M - 1))
-            pairs = self.singlets_per_sample[s]
+            s_idx = max(0, min(self.gs_sample_index, self.M - 1))
+            pairs = self.singlets_per_sample[s_idx]
+
+            # Draw singlet arcs
             for (i, j) in pairs:
                 xi, yi = x[i], y[i]
                 xj, yj = x[j], y[j]
-                # Straight chord between the two sites
                 self.ax_gs.plot(
                     [xi, xj],
                     [yi, yj],
@@ -616,22 +971,38 @@ class SDRGGroundStateGUI:
                     linewidth=1.2,
                     alpha=0.8
                 )
-            self.ax_gs.set_title(f"Sample {s}: singlets (lines) on ring of sites")
+
+            mode = self.mode_var.get()
+            if mode == "batch" and self.batch_L_list:
+                size_info = f"L = {L}, size idx = {self.batch_current_L_index}"
+            else:
+                size_info = f"L = {L}"
+
+            self.ax_gs.set_title(f"{size_info} | sample {s_idx}")
 
         self.ax_gs.set_xlim(-1.3, 1.3)
         self.ax_gs.set_ylim(-1.3, 1.3)
 
-        if self.gs_sample_label is not None:
-            if self.singlets_per_sample is None or self.M is None:
-                self.gs_sample_label.config(text="(no data)")
+        if self.gs_sample_label is not None and self.M is not None:
+            if self.mode_var.get() == "batch" and self.batch_L_list:
+                L_show = self.batch_L_list[self.batch_current_L_index]
+                self.gs_sample_label.config(
+                    text=f"L index {self.batch_current_L_index} (L={L_show}), "
+                         f"sample {self.gs_sample_index}/{self.M - 1}"
+                )
             else:
-                self.gs_sample_label.config(text=f"{self.gs_sample_index} / {self.M - 1}")
+                self.gs_sample_label.config(
+                    text=f"sample {self.gs_sample_index}/{self.M - 1}"
+                )
 
         self.fig_gs.tight_layout()
-        self.canvas_gs.draw_idle()
+        if self.canvas_gs is not None:
+            self.canvas_gs.draw_idle()
 
 
-# ---------------------- Entry point ---------------------- #
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     root = tk.Tk()
