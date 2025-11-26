@@ -224,7 +224,8 @@ class SDRGEnsembleGUI:
         # Row 2: # J bins
         ttk.Label(control_frame, text="# J bins:").grid(row=2, column=0, sticky="w")
         self.entry_bins = ttk.Entry(control_frame, width=6)
-        self.entry_bins.insert(0, "40")
+        self_bins_default = 40
+        self.entry_bins.insert(0, str(self_bins_default))
         self.entry_bins.grid(row=2, column=1, padx=4, pady=2)
 
         # Row 3: 3D toggle
@@ -511,7 +512,7 @@ class SDRGEnsembleGUI:
         steps_done = 0
 
         for k in range(1, max_steps + 1):
-            # Check if any chain can still be decimated
+            # Check if any chain can still be decimated with the usual rule
             if all(len(Js) < 3 for Js in chains):
                 break
 
@@ -595,8 +596,8 @@ class SDRGEnsembleGUI:
             return
         Omega_cur = self.comp_Omegas[idx]
         # Gamma defined via Omega0 and current Omega; slider controls both Ω and Γ
-        if self.Omega0 is not None and Omega_cur > 0:
-            Gamma = np.log(self.Omega0 / Omega_cur) if self.Omega0 > 0 else 0.0
+        if self.Omega0 is not None and self.Omega0 > 0 and Omega_cur > 0:
+            Gamma = np.log(self.Omega0 / Omega_cur)
             self.slider_info_label.config(
                 text=f"View step = {idx},  Ω = {Omega_cur:.3g},  Γ = {Gamma:.3g}"
             )
@@ -623,6 +624,75 @@ class SDRGEnsembleGUI:
         self.update_slider_info()
         self.update_hist_and_3d()
 
+    # ------------------------ Final collapse step (2 bonds -> 1 bond) ------------------------
+
+    def final_collapse_step(self):
+        """
+        When all chains have at most 2 bonds left, we perform one last SDRG-like step:
+        for any chain with exactly 2 bonds [J0, J1], we replace it by a single effective bond
+        J_total = J0 + J1. Chains with 1 or 0 bonds are left unchanged.
+
+        After this collapse, we rebuild J_current as a rectangular matrix and treat this as
+        one additional SDRG step in the RG flow.
+
+        The resulting single bonds are marked as 'inserted_bonds' so that they are
+        drawn in green in the 3D plot.
+        """
+        if self.chains is None:
+            return
+
+        new_inserted = []  # (sample_index, bond_index) created in this collapse
+
+        # Collapse chains of length 2 into length 1
+        for s, J_s in enumerate(self.chains):
+            if len(J_s) == 2:
+                J_total = J_s[0] + J_s[1]
+                self.chains[s] = [J_total]
+                # After collapse there is exactly one bond at index 0 -> mark as inserted
+                new_inserted.append((s, 0))
+            elif len(J_s) <= 1:
+                # leave as is
+                continue
+            else:
+                # Should not happen if called only when max length <= 2
+                pass
+
+        # Rebuild J_current with new maximum length
+        max_len = max((len(J_s) for J_s in self.chains), default=0)
+        if max_len == 0:
+            self.J_current = None
+        else:
+            M_cur = len(self.chains)
+            Jmat = np.zeros((M_cur, max_len), dtype=float)
+            for s, J_s in enumerate(self.chains):
+                J_list = list(J_s)
+                if len(J_list) < max_len:
+                    J_list = J_list + [0.0] * (max_len - len(J_list))
+                else:
+                    J_list = J_list[:max_len]
+                Jmat[s, :] = np.array(J_list, dtype=float)
+            self.J_current = Jmat
+
+        # Count this as one more SDRG step
+        self.step_count += 1
+
+        # Update Ω = max J over all chains
+        if self.J_current is not None:
+            all_J = self.J_current.ravel()
+            J_pos = all_J[all_J > 0]
+            Omega_cur = float(J_pos.max()) if J_pos.size > 0 else 0.0
+        else:
+            Omega_cur = 0.0
+
+        if Omega_cur > 0:
+            self.rg_steps.append(self.step_count)
+            self.rg_omegas.append(Omega_cur)
+
+        # Mark the new single bonds as inserted (green)
+        self.inserted_bonds = new_inserted
+        self.last_decimated = []
+        self.neighbor_bonds = []
+
     # --------------------------- SDRG animation (animation mode) -----------------------------
 
     def animate(self):
@@ -633,7 +703,15 @@ class SDRGEnsembleGUI:
         if self.chains is None:
             return
 
-        if all(len(J_s) < 3 for J_s in self.chains):
+        lengths = [len(J_s) for J_s in self.chains]
+        if len(lengths) == 0:
+            self.anim_running = False
+            return
+
+        max_len = max(lengths)
+
+        # If every chain has at most one bond left, we are truly done
+        if max_len <= 1:
             self.anim_running = False
             self.phase = 0
             self.pending_decimations = []
@@ -642,6 +720,16 @@ class SDRGEnsembleGUI:
             self.inserted_bonds = []
             return
 
+        # If all chains have length <= 2 but at least one has length 2,
+        # perform one final collapse step (2 bonds -> 1 bond) for all such chains.
+        if max_len <= 2 and all(l <= 2 for l in lengths):
+            self.final_collapse_step()
+            self.update_rg_plot()
+            self.update_hist_and_3d()
+            self.master.after(self.frame_delay_ms, self.animate)
+            return
+
+        # Otherwise, at least one chain has length >= 3: perform standard SDRG step
         if self.phase == 0:
             # Phase 0: choose bonds to decimate (highlight in red) and neighbors in orange
             self.pending_decimations = []
@@ -770,8 +858,7 @@ class SDRGEnsembleGUI:
                 centers = 0.5 * (edges[:-1] + edges[1:])
 
                 if N > 0:
-                    # IMPORTANT:
-                    # We explicitly convert the empirical histogram into a *probability density*:
+                    # Explicitly convert the empirical histogram into a *probability density*:
                     #   density[k] = counts[k] / (N * bin_width[k])
                     # so that sum_k density[k] * bin_width[k] = 1.
                     heights = counts / (N * widths)
