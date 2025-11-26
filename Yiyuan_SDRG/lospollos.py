@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 def sample_fermi_dirac(shape, rng: np.random.Generator):
     """
     Rejection sampling for a simple Fermi–Dirac–like positive J.
-    Here we just create a broad-tailed positive distribution.
+    This just produces a broad-tailed positive distribution.
     """
     size = int(np.prod(shape))
     out = np.empty(size, dtype=float)
@@ -68,19 +68,27 @@ class SDRGGroundStateGUI:
         self.J_init = None               # single-shot ensemble J (M x L)
         self.singlets_per_sample = None  # list of lists of (i,j) per sample
         self.C_avg = None                # averaged correlation C(r)
+        self.C_per_sample = None         # per-sample correlation profiles
         self.gaps = None                 # array of gaps per sample
         self.L = None
         self.M = None
 
-        # batch data: dict[L] -> {"gaps","singlets","C_avg","M"}
+        # batch data: dict[L] -> {"gaps","singlets","C_avg","C_per_sample","M","typical_indices"}
         self.batch_data = {}
         self.batch_L_list = []           # sorted list of L's
         self.batch_current_L_index = 0   # index into batch_L_list
+
+        # typical sample set (indices into 0..M-1), based on sampling ensemble
+        self.typical_indices = None
 
         # progress tracking
         self.decim_total = 1
         self.decim_done = 0
         self.batch_total_sizes = 1
+
+        # Typical-set controls
+        self.typical_metric_var = tk.StringVar(value="L2")        # "L2","L1","Chi2","KL"
+        self.typical_mode_var = tk.StringVar(value="fraction")    # "fraction" or "threshold"
 
         # Ground-state (singlet pattern) viewer window
         self.show_gs = tk.BooleanVar(value=False)
@@ -90,7 +98,9 @@ class SDRGGroundStateGUI:
         self.canvas_gs = None
         self.gs_sample_slider = None
         self.gs_sample_label = None
-        self.gs_sample_index = 0
+        self.gs_sample_index = 0   # actual sample index in 0..M-1
+        self.gs_slider_index = 0   # position on slider (0..n_avail-1)
+        self.typical_only_var = tk.BooleanVar(value=False)  # slider over typical samples only?
 
         # Gap-scaling fit window
         self.scaling_top = None
@@ -196,12 +206,38 @@ class SDRGGroundStateGUI:
         )
         self.check_gs.grid(row=4, column=2, columnspan=2, sticky="w", pady=(4, 2))
 
+        # Typical-set controls
+        ttk.Label(control_frame, text="Typical metric:").grid(row=5, column=0, sticky="w")
+        self.combo_typ_metric = ttk.Combobox(
+            control_frame,
+            values=["L2", "L1", "Chi2", "KL"],
+            width=8,
+            state="readonly",
+            textvariable=self.typical_metric_var
+        )
+        self.combo_typ_metric.grid(row=5, column=1, padx=4, pady=2, sticky="w")
+
+        ttk.Label(control_frame, text="Typical mode:").grid(row=5, column=2, sticky="w")
+        self.combo_typ_mode = ttk.Combobox(
+            control_frame,
+            values=["fraction", "threshold"],
+            width=10,
+            state="readonly",
+            textvariable=self.typical_mode_var
+        )
+        self.combo_typ_mode.grid(row=5, column=3, padx=4, pady=2, sticky="w")
+
+        ttk.Label(control_frame, text="Param (f or ε):").grid(row=5, column=4, sticky="w")
+        self.entry_typical_param = ttk.Entry(control_frame, width=6)
+        self.entry_typical_param.insert(0, "0.3")  # default: central 30% if fraction
+        self.entry_typical_param.grid(row=5, column=5, padx=4, pady=2)
+
         # Buttons
         self.button_sample = ttk.Button(control_frame, text="Sample ensemble (single)", command=self.on_sample)
-        self.button_sample.grid(row=5, column=0, padx=2, pady=4, sticky="ew")
+        self.button_sample.grid(row=6, column=0, padx=2, pady=4, sticky="ew")
 
         self.button_run = ttk.Button(control_frame, text="Run SDRG (compute)", command=self.on_run_sdrg)
-        self.button_run.grid(row=5, column=1, padx=2, pady=4, sticky="ew")
+        self.button_run.grid(row=6, column=1, padx=2, pady=4, sticky="ew")
 
         # ------- Progress + size slider -------
         self.status_label = ttk.Label(self.left_frame, text="Status: ready")
@@ -217,7 +253,7 @@ class SDRGGroundStateGUI:
         self.batch_progressbar = ttk.Progressbar(self.left_frame, orient="horizontal", length=260, mode="determinate")
         self.batch_progressbar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 5))
 
-        # NEW: size slider on main window
+        # Size slider on main window (for batch)
         self.size_label_main = ttk.Label(self.left_frame, text="Size index (batch): 0")
         self.size_label_main.pack(side=tk.TOP, anchor="w", pady=(4, 0))
         self.size_slider_main = tk.Scale(
@@ -232,10 +268,13 @@ class SDRGGroundStateGUI:
         self.size_slider_main.pack(side=tk.TOP, fill=tk.X, padx=5, pady=(0, 5))
 
         # ------- Correlation & gap plots (right) -------
-        self.fig_corr = plt.Figure(figsize=(8, 6))
-        gs = self.fig_corr.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.35)
-        self.ax_corr_avg = self.fig_corr.add_subplot(gs[0, 0])
-        self.ax_corr_hist = self.fig_corr.add_subplot(gs[1, 0])
+        self.fig_corr = plt.Figure(figsize=(10, 6))
+        gs = self.fig_corr.add_gridspec(2, 2, height_ratios=[1, 1], hspace=0.35, wspace=0.3)
+
+        self.ax_corr_avg = self.fig_corr.add_subplot(gs[0, 0])   # ensemble-averaged C(r)
+        self.ax_corr_typ = self.fig_corr.add_subplot(gs[0, 1])   # "typical" C(r)
+        self.ax_corr_hist = self.fig_corr.add_subplot(gs[1, 0])  # full gap distribution
+        self.ax_gap_typ = self.fig_corr.add_subplot(gs[1, 1])    # typical gap subset
 
         self.canvas_corr = FigureCanvasTkAgg(self.fig_corr, master=self.right_frame)
         self.canvas_corr_widget = self.canvas_corr.get_tk_widget()
@@ -262,7 +301,7 @@ class SDRGGroundStateGUI:
             self.entry_Lmax.config(state="disabled")
             self.entry_Lstep.config(state="disabled")
         else:
-            self.status_label.config(text="Status: batch mode selected (sampling done inside 'Run SDRG')")
+            self.status_label.config(text="Status: batch mode selected (sampling is done inside 'Run SDRG')")
 
             self.entry_L.config(state="disabled")
             self.button_sample.config(state="disabled")
@@ -300,7 +339,9 @@ class SDRGGroundStateGUI:
         # Reset SDRG-related data
         self.singlets_per_sample = None
         self.C_avg = None
+        self.C_per_sample = None
         self.gaps = None
+        self.typical_indices = None
 
         # Reset progress bars
         self.decim_total = 0
@@ -344,10 +385,15 @@ class SDRGGroundStateGUI:
         self.status_label.config(text="Status: running SDRG (single-shot)...")
         self.master.update_idletasks()
 
+        # Run SDRG using initial couplings
         singlets_all, gaps_all = self.run_sdrg_ensemble(self.J_init, L)
         self.singlets_per_sample = singlets_all
         self.gaps = gaps_all
-        self.C_avg = self.compute_C_from_singlets(singlets_all, L, M)
+
+        # Compute ensemble-average C(r) and per-sample C_s(r)
+        self.C_avg, self.C_per_sample = self.compute_C_from_singlets(singlets_all, L, M)
+        # Compute sampling-typical sample set based on J_init (not on gaps)
+        self.typical_indices = self.compute_typical_indices_from_J(self.J_init)
 
         self.status_label.config(text="Status: SDRG complete (single-shot)")
 
@@ -406,17 +452,23 @@ class SDRGGroundStateGUI:
         scaling_y = []
 
         for idx_L, L in enumerate(L_list):
+            # Sample ensemble for this L
             J_ensemble = sample_couplings(L, M, dist_name, rng)
             singlets_all, gaps_all = self.run_sdrg_ensemble(J_ensemble, L)
-            C_avg_L = self.compute_C_from_singlets(singlets_all, L, M)
+            C_avg_L, C_per_sample_L = self.compute_C_from_singlets(singlets_all, L, M)
+            # sampling-typical indices for this L
+            typical_idx_L = self.compute_typical_indices_from_J(J_ensemble)
 
             self.batch_data[L] = {
                 "gaps": gaps_all,
                 "singlets": singlets_all,
                 "C_avg": C_avg_L,
+                "C_per_sample": C_per_sample_L,
                 "M": M,
+                "typical_indices": typical_idx_L,
             }
 
+            # For gap scaling plot: average -log gap over positive gaps
             gaps_pos = gaps_all[gaps_all > 0]
             if gaps_pos.size > 0:
                 avg_loggap = np.mean(-np.log(gaps_pos))
@@ -569,43 +621,45 @@ class SDRGGroundStateGUI:
         return singlets, gap
 
     # ====================================================
-    # Derived observables: C(r) and gap histogram
+    # Derived observables: C(r) and typical indices
     # ====================================================
 
     def compute_C_from_singlets(self, singlets_per_sample, L, M):
         """
         From singlets (i,j) in each sample, compute
-        C(r) = -3/4 * P_singlet(r), where P_singlet(r)
-        is probability that a pair at distance r is a singlet.
 
-        We approximate P_singlet(r) by counting singlets at distance r
-        and dividing by M*L (total number of (i,i+r) pairs on a ring).
+          C_s(r) for each sample s, and
+          C_avg(r) = (1/M) sum_s C_s(r).
+
+        We define
+
+          C_s(r) = -3/4 * [ (# singlets at distance r in sample s ) / L ].
+
+        This matches C_avg(r) = -3/4 * (#all singlets at r)/(M*L).
         """
         if singlets_per_sample is None or L is None or M is None:
-            return None
+            return None, None
 
         d_max = L // 2
         if d_max < 1:
-            return None
+            return None, None
 
-        counts = np.zeros(d_max + 1, dtype=int)
+        C_per_sample = np.zeros((M, d_max + 1), dtype=float)
 
-        for singlets in singlets_per_sample:
+        for s, singlets in enumerate(singlets_per_sample):
+            counts_s = np.zeros(d_max + 1, dtype=int)
             for (i, j) in singlets:
                 dx = abs(i - j)
                 d = min(dx, L - dx)
                 if 0 <= d <= d_max:
-                    counts[d] += 1
+                    counts_s[d] += 1
+            C_per_sample[s, :] = -0.75 * counts_s / float(L)
 
-        total_pairs = M * L
-        C_avg = np.zeros(d_max + 1, dtype=float)
-        if total_pairs > 0:
-            P_r = counts / float(total_pairs)
-            C_avg = -0.75 * P_r
-
-        return C_avg
+        C_avg = np.mean(C_per_sample, axis=0)
+        return C_avg, C_per_sample
 
     def get_hist_bins(self):
+        """Number of bins for gap histogram (also reused for 'typical set' histogram)."""
         try:
             nb = int(self.entry_bins.get())
             if nb < 1:
@@ -614,25 +668,152 @@ class SDRGGroundStateGUI:
             nb = 20
         return nb
 
+    def compute_typical_indices_from_J(self, J_ensemble, nbins=None):
+        """
+        Define 'typical' samples as those whose empirical J-distribution
+        is closest to the global J-distribution (in histogram space).
+
+        Steps:
+          - Build a global histogram P_global(J) from all bonds.
+          - For each chain s, build P_s(J) over its L bonds (same bin edges).
+          - Compute a distance d_s between P_s and P_global, using a metric
+            chosen in the GUI ('L2','L1','Chi2','KL').
+          - Depending on 'Typical mode':
+              * 'fraction': choose the central fraction f of samples with
+                smallest d_s (f from GUI).
+              * 'threshold': choose all samples with d_s <= ε (ε from GUI).
+        """
+        if J_ensemble is None:
+            return None
+        M, L = J_ensemble.shape
+        if M == 0 or L == 0:
+            return None
+
+        if nbins is None:
+            nbins = self.get_hist_bins()
+
+        # Flatten all bonds and build global histogram
+        all_J = J_ensemble.reshape(-1)
+        if all_J.size == 0:
+            return list(range(M))
+
+        counts_global, edges = np.histogram(all_J, bins=nbins, density=True)
+        if counts_global.sum() <= 0:
+            # If everything is zero, treat all samples as typical
+            return list(range(M))
+        P_global = counts_global / counts_global.sum()
+        eps = 1e-12
+
+        metric = self.typical_metric_var.get()
+
+        # Helper: distance between P_s and P_global
+        def distance(P_s, P_g):
+            if metric == "L1":
+                return float(np.sum(np.abs(P_s - P_g)))
+            elif metric == "Chi2":
+                denom = P_g + eps
+                return float(np.sum((P_s - P_g) ** 2 / denom))
+            elif metric == "KL":
+                P_s_safe = P_s + eps
+                P_g_safe = P_g + eps
+                return float(np.sum(P_s_safe * np.log(P_s_safe / P_g_safe)))
+            else:  # "L2" or unknown -> default to L2
+                return float(np.linalg.norm(P_s - P_g))
+
+        # Per-sample distances
+        d_list = []
+        for s in range(M):
+            J_s = J_ensemble[s, :]
+            counts_s, _ = np.histogram(J_s, bins=edges, density=True)
+            if counts_s.sum() <= 0:
+                d = np.inf
+            else:
+                P_s = counts_s / counts_s.sum()
+                d = distance(P_s, P_global)
+            d_list.append(d)
+        d_list = np.array(d_list)
+
+        idx_all = np.arange(M)
+        finite_mask = np.isfinite(d_list)
+        if not finite_mask.any():
+            return idx_all.tolist()
+
+        idx_valid = idx_all[finite_mask]
+        d_valid = d_list[finite_mask]
+
+        order = np.argsort(d_valid)
+        idx_sorted = idx_valid[order]
+        d_sorted = d_valid[order]
+
+        if len(idx_sorted) <= 3:
+            return idx_sorted.tolist()
+
+        # Read user parameter (fraction f or threshold ε)
+        try:
+            param = float(self.entry_typical_param.get())
+        except ValueError:
+            param = None
+
+        mode = self.typical_mode_var.get()
+
+        chosen = None
+
+        if mode == "threshold" and param is not None and param > 0.0:
+            epsilon = param
+            mask_thr = d_sorted <= epsilon
+            if mask_thr.any():
+                chosen = idx_sorted[mask_thr]
+
+        # If threshold mode gave nothing (or invalid epsilon), fall back to fraction
+        if chosen is None or chosen.size == 0:
+            # Fraction mode
+            if param is None or param <= 0.0 or param > 1.0:
+                frac = 0.3  # default central 30%
+            else:
+                frac = param
+            n_typ = max(1, int(round(frac * len(idx_sorted))))
+            if n_typ >= len(idx_sorted):
+                chosen = idx_sorted
+            else:
+                offset = (len(idx_sorted) - n_typ) // 2
+                chosen = idx_sorted[offset: offset + n_typ]
+
+        return sorted(chosen.tolist())
+
+    # ====================================================
+    # Correlation & gap plots (avg, typical)
+    # ====================================================
+
     def update_corr_plots(self):
-        """Update the correlation plot (top) and gap histogram (bottom)."""
+        """Update the correlation plots (avg & typical) and gap histograms."""
         self.ax_corr_avg.clear()
+        self.ax_corr_typ.clear()
         self.ax_corr_hist.clear()
+        self.ax_gap_typ.clear()
 
         if self.C_avg is None or self.L is None or self.gaps is None:
-            self.ax_corr_avg.set_title("Singlet-based correlation profile (no data)")
+            # No data yet
+            self.ax_corr_avg.set_title("Singlet-based correlation profile (average, no data)")
             self.ax_corr_avg.set_xlabel("distance r")
             self.ax_corr_avg.set_ylabel("-C(r)")
+
+            self.ax_corr_typ.set_title("Typical correlation profile (no data)")
+            self.ax_corr_typ.set_xlabel("distance r")
+            self.ax_corr_typ.set_ylabel("|C(r)|")
 
             self.ax_corr_hist.set_title("Gap distribution (no data)")
             self.ax_corr_hist.set_xlabel(r"$-\log \Delta$")
             self.ax_corr_hist.set_ylabel("probability density")
 
+            self.ax_gap_typ.set_title("Typical gap subset (no data)")
+            self.ax_gap_typ.set_xlabel(r"$-\log \Delta_{\mathrm{typ}}$")
+            self.ax_gap_typ.set_ylabel("probability density")
+
             self.fig_corr.tight_layout()
             self.canvas_corr.draw_idle()
             return
 
-        # --- Correlation plot: log-log, compare to 1/r^2 ---
+        # ===== Average correlation (top-left) =====
         L = self.L
         d_max = L // 2
         distances = np.arange(0, d_max + 1)
@@ -645,7 +826,7 @@ class SDRGGroundStateGUI:
         C_plot = C_plot[mask]
 
         if r_plot.size > 0:
-            self.ax_corr_avg.loglog(r_plot, C_plot, "o-", label="SDRG", markersize=4)
+            self.ax_corr_avg.loglog(r_plot, C_plot, "o-", label="SDRG avg", markersize=4)
             theory = 1.0 / (r_plot ** 2)
             scale_factor = C_plot[0] / theory[0]
             theory_scaled = theory * scale_factor
@@ -659,7 +840,46 @@ class SDRGGroundStateGUI:
             self.ax_corr_avg.set_xlabel("distance r")
             self.ax_corr_avg.set_ylabel("-C(r)")
 
-        # --- Gap distribution: histogram of -log(Δ) with log y-axis ---
+        # ===== Typical correlation (top-right) =====
+        if self.C_per_sample is not None and self.C_per_sample.size > 0:
+            M = self.C_per_sample.shape[0]
+            if self.typical_indices and len(self.typical_indices) > 0:
+                idxs = np.array(self.typical_indices, dtype=int)
+                idxs = idxs[(0 <= idxs) & (idxs < M)]
+                if idxs.size == 0:
+                    idxs = np.arange(M)
+            else:
+                idxs = np.arange(M)
+
+            # "Typical" magnitude: median over sampling-typical chains of |C_s(r)|
+            C_sub = self.C_per_sample[idxs, :]
+            C_mag = np.abs(C_sub[:, 1:])        # skip r=0
+            if C_mag.size > 0:
+                C_typ = np.median(C_mag, axis=0)
+                r_typ = distances[1:]
+                mask2 = C_typ > 0
+                r_typ = r_typ[mask2]
+                C_typ = C_typ[mask2]
+                if r_typ.size > 0:
+                    self.ax_corr_typ.loglog(r_typ, C_typ, "o-", markersize=4, label="typical |C(r)|")
+                    self.ax_corr_typ.set_xlabel("distance r")
+                    self.ax_corr_typ.set_ylabel("|C(r)|")
+                    self.ax_corr_typ.set_title("Log–log typical correlations (sampling-typical chains)")
+                    self.ax_corr_typ.legend()
+                else:
+                    self.ax_corr_typ.set_title("Typical correlations (all zero)")
+                    self.ax_corr_typ.set_xlabel("distance r")
+                    self.ax_corr_typ.set_ylabel("|C(r)|")
+            else:
+                self.ax_corr_typ.set_title("Typical correlations (no data)")
+                self.ax_corr_typ.set_xlabel("distance r")
+                self.ax_corr_typ.set_ylabel("|C(r)|")
+        else:
+            self.ax_corr_typ.set_title("Typical correlations (no data)")
+            self.ax_corr_typ.set_xlabel("distance r")
+            self.ax_corr_typ.set_ylabel("|C(r)|")
+
+        # ===== Gap distribution (bottom-left, full ensemble) =====
         gaps = self.gaps
         gaps_pos = gaps[gaps > 0]
         nb = self.get_hist_bins()
@@ -684,10 +904,10 @@ class SDRGGroundStateGUI:
                 edgecolor='black',
                 alpha=0.7
             )
-            self.ax_corr_hist.set_xlabel(r"$-\log \Delta$  (with $\Delta = \mathrm{gap}$)")
+            self.ax_corr_hist.set_xlabel(r"$-\log \Delta$")
             self.ax_corr_hist.set_ylabel("probability density")
             self.ax_corr_hist.set_yscale("log")
-            self.ax_corr_hist.set_title(r"Distribution of $-\log \Delta$ across ensemble")
+            self.ax_corr_hist.set_title(r"Gap distribution across ensemble")
 
             mean_gap = float(np.mean(gaps_pos))
             self.ax_corr_hist.text(
@@ -700,6 +920,41 @@ class SDRGGroundStateGUI:
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
             )
 
+        # ===== Typical gap subset (bottom-right, only sampling-typical samples) =====
+        if self.typical_indices and len(self.typical_indices) > 0:
+            idxs = np.array(self.typical_indices, dtype=int)
+            idxs = idxs[(idxs >= 0) & (idxs < len(self.gaps))]
+            gaps_typ = self.gaps[idxs]
+            gaps_typ_pos = gaps_typ[gaps_typ > 0]
+        else:
+            gaps_typ_pos = np.array([])
+
+        if gaps_typ_pos.size == 0:
+            self.ax_gap_typ.set_title("Typical gap subset (no positive gaps)")
+            self.ax_gap_typ.set_xlabel(r"$-\log \Delta_{\mathrm{typ}}$")
+            self.ax_gap_typ.set_ylabel("probability density")
+        else:
+            g_log_typ = -np.log(gaps_typ_pos)
+            gl_min = float(g_log_typ.min())
+            gl_max = float(g_log_typ.max())
+            if gl_max == gl_min:
+                gl_min = gl_min - 0.5 if gl_min != 0 else -0.5
+                gl_max = gl_max + 0.5 if gl_max != 0 else 0.5
+
+            self.ax_gap_typ.hist(
+                g_log_typ,
+                bins=nb,
+                range=(gl_min, gl_max),
+                density=True,
+                edgecolor='black',
+                alpha=0.7,
+                color='C1'
+            )
+            self.ax_gap_typ.set_xlabel(r"$-\log \Delta_{\mathrm{typ}}$")
+            self.ax_gap_typ.set_ylabel("probability density")
+            self.ax_gap_typ.set_yscale("log")
+            self.ax_gap_typ.set_title("Gap distribution restricted to sampling-typical chains")
+
         self.fig_corr.tight_layout()
         self.canvas_corr.draw_idle()
 
@@ -709,7 +964,7 @@ class SDRGGroundStateGUI:
 
     def create_scaling_window(self, x_vals, y_vals):
         """
-        x_vals ~ sqrt(L), y_vals ~ ⟨-log gap⟩_disorder.
+        x_vals ~ sqrt(L), y_vals ~ ⟨-log(gap)⟩_disorder.
         Plot and fit y = a x + b.
         """
         mask = np.isfinite(x_vals) & np.isfinite(y_vals)
@@ -763,7 +1018,7 @@ class SDRGGroundStateGUI:
                 self.on_close_gs()
 
     def create_gs_window(self):
-        """Create the singlet viewer window (one slider: sample index)."""
+        """Create the singlet viewer window (with sample slider and typical toggle)."""
         if self.gs_top is not None:
             return
 
@@ -782,7 +1037,7 @@ class SDRGGroundStateGUI:
         self.canvas_gs_widget = self.canvas_gs.get_tk_widget()
         self.canvas_gs_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Only sample slider now
+        # Sliders + toggles
         slider_frame = ttk.Frame(self.gs_top)
         slider_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
         slider_frame.columnconfigure(1, weight=1)
@@ -799,8 +1054,17 @@ class SDRGGroundStateGUI:
         )
         self.gs_sample_slider.grid(row=0, column=1, sticky="ew", padx=5)
 
+        # Toggle for "typical ground states only"
+        self.typical_only_check = ttk.Checkbutton(
+            slider_frame,
+            text="Typical only (sampling ensemble)",
+            variable=self.typical_only_var,
+            command=self.on_toggle_typical_only
+        )
+        self.typical_only_check.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
         self.gs_sample_label = ttk.Label(slider_frame, text="(no data)")
-        self.gs_sample_label.grid(row=1, column=0, columnspan=2, sticky="e")
+        self.gs_sample_label.grid(row=1, column=1, sticky="e")
 
         self.gs_top.protocol("WM_DELETE_WINDOW", self.on_close_gs)
 
@@ -818,6 +1082,7 @@ class SDRGGroundStateGUI:
         self.canvas_gs = None
         self.gs_sample_slider = None
         self.gs_sample_label = None
+        self.typical_only_check = None
         self.show_gs.set(False)
 
     # ---- Size slider (main window) and sample slider (GS window) ----
@@ -850,20 +1115,53 @@ class SDRGGroundStateGUI:
             self.size_label_main.config(text="Size index: 0")
 
     def update_sample_slider_range(self):
-        """Configure the sample slider in the GS window."""
+        """Configure the sample slider in the GS window (honouring 'typical only')."""
         if self.gs_sample_slider is None:
             return
 
-        if self.M is not None and self.M > 0:
-            max_s = self.M - 1
-            self.gs_sample_slider.config(state="normal", from_=0, to=max_s)
-            idx = max(0, min(self.gs_sample_index, max_s))
-            self.gs_sample_index = idx
-            self.gs_sample_slider.set(idx)
-        else:
+        if self.M is None or self.M <= 0:
             self.gs_sample_slider.config(state="disabled", from_=0, to=0)
             self.gs_sample_slider.set(0)
+            self.gs_slider_index = 0
             self.gs_sample_index = 0
+            if self.gs_sample_label is not None:
+                self.gs_sample_label.config(text="(no data)")
+            return
+
+        # Decide how many samples are available depending on typical-only toggle
+        if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+            n_avail = len(self.typical_indices)
+        else:
+            n_avail = self.M
+
+        if n_avail <= 0:
+            self.gs_sample_slider.config(state="disabled", from_=0, to=0)
+            self.gs_sample_slider.set(0)
+            self.gs_slider_index = 0
+            self.gs_sample_index = 0
+            if self.gs_sample_label is not None:
+                self.gs_sample_label.config(text="(no data)")
+            return
+
+        self.gs_sample_slider.config(state="normal", from_=0, to=n_avail - 1)
+        # Reset slider to 0 in new regime
+        self.gs_slider_index = 0
+        if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+            self.gs_sample_index = self.typical_indices[0]
+        else:
+            self.gs_sample_index = 0
+        self.gs_sample_slider.set(0)
+
+        # Update label
+        if self.gs_sample_label is not None:
+            if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+                self.gs_sample_label.config(
+                    text=f"typ slider 0 (sample {self.gs_sample_index} of {self.M - 1})"
+                )
+            else:
+                self.gs_sample_label.config(
+                    text=f"sample 0/{self.M - 1}"
+                )
 
     def on_size_slider_main_change(self, value):
         """When user moves the size slider in batch mode, switch to that L."""
@@ -883,26 +1181,48 @@ class SDRGGroundStateGUI:
             pass
 
     def on_gs_sample_slider_change(self, value):
-        """When user moves the sample slider, update singlet drawing."""
+        """When user moves the sample slider, map slider index to actual sample index."""
         try:
-            idx = int(float(value))
+            slider_idx = int(float(value))
         except ValueError:
-            idx = 0
+            slider_idx = 0
 
-        if self.M is not None and self.M > 0:
-            idx = max(0, min(idx, self.M - 1))
+        if self.M is None or self.M <= 0:
+            self.gs_slider_index = 0
+            self.gs_sample_index = 0
+            return
+
+        # clamp slider index to available
+        if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+            n_avail = len(self.typical_indices)
         else:
-            idx = 0
+            n_avail = self.M
 
-        self.gs_sample_index = idx
+        if n_avail <= 0:
+            self.gs_slider_index = 0
+            self.gs_sample_index = 0
+            return
+
+        slider_idx = max(0, min(slider_idx, n_avail - 1))
+        self.gs_slider_index = slider_idx
+
+        if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+            self.gs_sample_index = self.typical_indices[slider_idx]
+        else:
+            self.gs_sample_index = slider_idx
+
+        self.update_gs_viewer()
+
+    def on_toggle_typical_only(self):
+        """User toggled 'typical only' for ground-state slider."""
         self.update_sample_slider_range()
         self.update_gs_viewer()
 
     def set_active_size_index(self, idx):
         """
         In batch mode: pick which L (index in batch_L_list) is active.
-        This sets L, M, singlets_per_sample, C_avg, gaps, so the
-        main plots and GS viewer can use them.
+        This sets L, M, singlets_per_sample, C_avg, C_per_sample, gaps, typical_indices
+        so the main plots and GS viewer can use them.
         """
         if self.mode_var.get() != "batch":
             return
@@ -921,7 +1241,9 @@ class SDRGGroundStateGUI:
         self.M = data.get("M", len(data["singlets"]))
         self.singlets_per_sample = data["singlets"]
         self.C_avg = data["C_avg"]
+        self.C_per_sample = data.get("C_per_sample")
         self.gaps = data["gaps"]
+        self.typical_indices = data.get("typical_indices")
 
     def update_gs_viewer(self):
         """Redraw the singlet picture (if the GS window is open)."""
@@ -957,10 +1279,15 @@ class SDRGGroundStateGUI:
         if self.singlets_per_sample is None or self.M is None:
             self.ax_gs.set_title("No ground-state singlets computed yet.")
         else:
-            s_idx = max(0, min(self.gs_sample_index, self.M - 1))
+            # Actual sample index we are showing
+            s_idx = self.gs_sample_index
+            if s_idx < 0 or s_idx >= self.M:
+                s_idx = 0
+                self.gs_sample_index = 0
+
             pairs = self.singlets_per_sample[s_idx]
 
-            # Draw singlet arcs
+            # Draw singlet chords
             for (i, j) in pairs:
                 xi, yi = x[i], y[i]
                 xj, yj = x[j], y[j]
@@ -978,17 +1305,21 @@ class SDRGGroundStateGUI:
             else:
                 size_info = f"L = {L}"
 
-            self.ax_gs.set_title(f"{size_info} | sample {s_idx}")
+            # slider info, depending on typical-only
+            if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
+                slider_info = f"typ slider {self.gs_slider_index} (sample {s_idx} of {self.M - 1})"
+            else:
+                slider_info = f"sample {s_idx}/{self.M - 1}"
+
+            self.ax_gs.set_title(f"{size_info} | {slider_info}")
 
         self.ax_gs.set_xlim(-1.3, 1.3)
         self.ax_gs.set_ylim(-1.3, 1.3)
 
         if self.gs_sample_label is not None and self.M is not None:
-            if self.mode_var.get() == "batch" and self.batch_L_list:
-                L_show = self.batch_L_list[self.batch_current_L_index]
+            if self.typical_only_var.get() and self.typical_indices and len(self.typical_indices) > 0:
                 self.gs_sample_label.config(
-                    text=f"L index {self.batch_current_L_index} (L={L_show}), "
-                         f"sample {self.gs_sample_index}/{self.M - 1}"
+                    text=f"typical slider {self.gs_slider_index} (sample {self.gs_sample_index} of {self.M - 1})"
                 )
             else:
                 self.gs_sample_label.config(
