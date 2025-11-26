@@ -6,9 +6,11 @@ SDRG ground-state viewer (batch mode only).
 - Run SDRG down to the last bond for each sample:
     - At each step, freeze the strongest bond into a singlet.
     - Keep track of all singlets (pairs of original site indices).
+    - Track the last decimated (effective) bond energy as the "first excitation gap".
 - Main window:
-    - Top: ensemble-averaged two-point correlations <S_i · S_j> vs |i-j|.
-    - Bottom: histogram of C_ij at a fixed |i-j| across ensemble.
+    - Top: ensemble singlet-based "correlation profile"
+      C(r) = -3/4 * (number of singlets at distance r) / N, where N is total #singlets.
+    - Bottom: histogram of the first excitation gaps across the ensemble.
 - Separate window:
     - Visualizes singlet patterns for a selectable sample:
       spins on a circle, singlets as straight chords.
@@ -77,13 +79,13 @@ def sample_couplings(L: int, M: int, dist_name: str, rng: np.random.Generator) -
 class SDRGGroundStateGUI:
     def __init__(self, master):
         self.master = master
-        master.title("SDRG ground-state viewer — ensemble-averaged correlations + singlet patterns")
+        master.title("SDRG ground-state viewer — singlet profile + gap distribution")
 
         # Ensemble data
-        self.J_init = None            # (M, L) array of initial couplings
-        self.singlets_per_sample = None  # list of length M, each a list of (i,j) singlet pairs
-        self.C_avg = None             # array C_avg[d] = average <S_i · S_j> for distance d
-        self.C_values_by_dist = None  # dict d -> list of individual C_ij values
+        self.J_init = None              # (M, L) array of initial couplings
+        self.singlets_per_sample = None # list of length M, each a list of (i,j) singlet pairs
+        self.C_avg = None               # C_avg[r] = -3/4 * (#singlets at distance r)/N
+        self.gaps = None                # array of length M: last decimated (effective) bond energy
         self.L = None
         self.M = None
 
@@ -110,7 +112,7 @@ class SDRGGroundStateGUI:
         self.right_frame = ttk.Frame(main_frame)
         self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # ---- Controls on the left (similar to Version 1, no animation) ---- #
+        # ---- Controls on the left ---- #
 
         control_frame = ttk.Frame(self.left_frame)
         control_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
@@ -147,17 +149,13 @@ class SDRGGroundStateGUI:
         self.entry_seed.insert(0, "0")
         self.entry_seed.grid(row=1, column=5, padx=4, pady=2)
 
-        ttk.Label(control_frame, text="# bins (C hist):").grid(row=2, column=0, sticky="w")
+        ttk.Label(control_frame, text="# bins (gap hist):").grid(row=2, column=0, sticky="w")
         self.entry_bins = ttk.Entry(control_frame, width=6)
         self.entry_bins.insert(0, "20")
         self.entry_bins.grid(row=2, column=1, padx=4, pady=2)
 
-        ttk.Label(control_frame, text="Distance |i-j|:").grid(row=2, column=2, sticky="w")
-        self.entry_dist = ttk.Entry(control_frame, width=6)
-        self.entry_dist.insert(0, "1")
-        self.entry_dist.grid(row=2, column=3, padx=4, pady=2)
-        # Hitting Enter in this box updates the histogram
-        self.entry_dist.bind("<Return>", lambda event: self.update_corr_plots())
+        # We keep an entry for distance but only for potential extension; unused in hist now.
+        ttk.Label(control_frame, text="(distance entry unused)").grid(row=2, column=2, columnspan=2, sticky="w")
 
         # Toggle for ground-state viewer window
         self.check_gs = ttk.Checkbutton(
@@ -182,7 +180,7 @@ class SDRGGroundStateGUI:
         self.progressbar = ttk.Progressbar(self.left_frame, orient="horizontal", length=260, mode="determinate")
         self.progressbar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 5))
 
-        # ---- Correlation plots on the right ---- #
+        # ---- Correlation / gap plots on the right ---- #
 
         self.fig_corr = plt.Figure(figsize=(8, 6))
         gs = self.fig_corr.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.35)
@@ -195,6 +193,11 @@ class SDRGGroundStateGUI:
 
         self.update_corr_plots()
 
+        # Dummy entry_dist just to keep compatibility with earlier layout (not used)
+        self.entry_dist = ttk.Entry(control_frame, width=6)
+        self.entry_dist.insert(0, "1")
+        self.entry_dist.grid_remove()  # hide it
+
     # ---------------------- Sampling + SDRG ---------------------- #
 
     def on_sample(self):
@@ -203,10 +206,11 @@ class SDRGGroundStateGUI:
             L = int(self.entry_L.get())
             M = int(self.entry_M.get())
             seed = int(self.entry_seed.get())
-            if L <= 1 or M <= 0:
+            if L <= 1 or M <= 0 or L % 2 != 0:
+                # We want even L so that L/2 singlets per chain is natural.
                 raise ValueError
         except ValueError:
-            self.status_label.config(text="Status: invalid L or M")
+            self.status_label.config(text="Status: invalid L or M (L must be even, L>1, M>0)")
             return
 
         self.L = L
@@ -219,7 +223,7 @@ class SDRGGroundStateGUI:
         # Reset SDRG-derived data
         self.singlets_per_sample = None
         self.C_avg = None
-        self.C_values_by_dist = None
+        self.gaps = None
 
         self.progressbar['mode'] = 'determinate'
         self.progressbar['maximum'] = 1
@@ -240,7 +244,8 @@ class SDRGGroundStateGUI:
             self.status_label.config(text="Status: internal error (L,M)")
             return
 
-        # Rough upper bound on the number of decimations
+        # Each chain of length L (even) eventually yields L/2 singlets.
+        # Total decimations ~ M * (L/2).
         est_max_decim = M * (L // 2)
         if est_max_decim <= 0:
             est_max_decim = 1
@@ -252,12 +257,14 @@ class SDRGGroundStateGUI:
         self.master.update_idletasks()
 
         singlets_all = []
+        gaps_all = []
         decim_done = 0
 
         for s in range(M):
             J_row = self.J_init[s, :]
-            singlets_s = self.run_sdrg_single_chain(J_row, L)
+            singlets_s, gap_s = self.run_sdrg_single_chain(J_row, L)
             singlets_all.append(singlets_s)
+            gaps_all.append(gap_s)
             decim_done += len(singlets_s)
             if decim_done > est_max_decim:
                 decim_done = est_max_decim
@@ -269,9 +276,10 @@ class SDRGGroundStateGUI:
             self.progressbar['value'] = est_max_decim
 
         self.singlets_per_sample = singlets_all
-        self.status_label.config(text="Status: SDRG complete (ground-state singlets stored)")
+        self.gaps = np.array(gaps_all, dtype=float)
+        self.status_label.config(text="Status: SDRG complete (ground-state singlets + gaps stored)")
 
-        # Compute ensemble-averaged correlations
+        # Compute ensemble-averaged correlation profile from singlet distances
         self.compute_correlations()
         self.update_corr_plots()
         self.update_gs_viewer()
@@ -291,6 +299,10 @@ class SDRGGroundStateGUI:
         - Find the remaining neighbors k of i and l of j (if any).
         - Generate effective coupling J_eff = J_ik J_jl / (2 J_ij) between k and l (if both exist).
         - Remove i and j and all incident edges.
+
+        Returns:
+            singlets: list of (i,j) singlet pairs
+            final_gap: the last decimated J_max (first excitation gap scale)
         """
         edges = {}
         neighbors = {i: set() for i in range(L)}
@@ -302,18 +314,19 @@ class SDRGGroundStateGUI:
             if Jval <= 0:
                 continue
             key = frozenset((i, j))
-            # If there is already an edge (e.g. from some previous convention), add them
             edges[key] = edges.get(key, 0.0) + Jval
             neighbors[i].add(j)
             neighbors[j].add(i)
 
         singlets = []
+        final_gap = 0.0  # default in case edges is empty
 
         while edges:
             # Pick the strongest bond
             key_max, J_max = max(edges.items(), key=lambda kv: kv[1])
             i, j = tuple(key_max)
             singlets.append((i, j))
+            final_gap = float(J_max)  # update the last decimated energy scale
 
             # Neighbors excluding each other
             nei_i = set(neighbors.get(i, set()))
@@ -353,64 +366,47 @@ class SDRGGroundStateGUI:
             neighbors.pop(i, None)
             neighbors.pop(j, None)
 
-        return singlets
+        return singlets, final_gap
 
     # ---------------------- Correlation computation ---------------------- #
 
     def compute_correlations(self):
         """
-        Using singlets_per_sample, compute:
+        From the singlet structure across the ensemble, compute:
 
-        - C_avg[d] = average <S_i⋅S_j> over all samples and pairs with distance d.
-          Here <S_i⋅S_j> is approximated by:
-              -3/4 if (i,j) form a singlet in that sample,
-               0   otherwise.
-        - C_values_by_dist[d] = list of all individual C_ij values across ensemble
-          for that distance d, for building histograms.
+        C_avg[r] = -3/4 * (number of singlet pairs at distance r) / N,
+
+        where distance r is the minimal distance on the ring, and
+        N is the total number of singlet pairs across all samples.
         """
         if self.singlets_per_sample is None or self.L is None or self.M is None:
             self.C_avg = None
-            self.C_values_by_dist = None
             return
 
         L = self.L
-        M = self.M
         d_max = L // 2
         if d_max < 1:
             self.C_avg = None
-            self.C_values_by_dist = None
             return
 
-        C_values_by_dist = {d: [] for d in range(1, d_max + 1)}
+        counts = np.zeros(d_max + 1, dtype=int)
+        total_pairs = 0
 
-        # For each sample, create a set of singlet pairs
-        for s in range(M):
-            singlets = self.singlets_per_sample[s]
-            singlet_set = {frozenset((i, j)) for (i, j) in singlets}
-            # For each distance d, we loop over i and look at pair (i, i+d mod L)
-            for d in range(1, d_max + 1):
-                vals = C_values_by_dist[d]
-                for i in range(L):
-                    j = (i + d) % L
-                    pair_key = frozenset((i, j))
-                    if pair_key in singlet_set:
-                        vals.append(-0.75)
-                    else:
-                        vals.append(0.0)
+        for singlets in self.singlets_per_sample:
+            total_pairs += len(singlets)
+            for (i, j) in singlets:
+                dx = abs(i - j)
+                d = min(dx, L - dx)
+                if 1 <= d <= d_max:
+                    counts[d] += 1
 
-        # Average correlation per distance
         C_avg = np.zeros(d_max + 1, dtype=float)
-        for d in range(1, d_max + 1):
-            vals = C_values_by_dist[d]
-            if len(vals) > 0:
-                C_avg[d] = float(np.mean(vals))
-            else:
-                C_avg[d] = 0.0
+        if total_pairs > 0:
+            C_avg = -0.75 * counts / float(total_pairs)
 
         self.C_avg = C_avg
-        self.C_values_by_dist = C_values_by_dist
 
-    # ---------------------- Correlation plots ---------------------- #
+    # ---------------------- Correlation / gap plots ---------------------- #
 
     def get_hist_bins(self):
         try:
@@ -421,35 +417,19 @@ class SDRGGroundStateGUI:
             nb = 20
         return nb
 
-    def get_selected_distance(self):
-        if self.L is None:
-            return None
-        d_max = self.L // 2
-        if d_max < 1:
-            return None
-        try:
-            d = int(self.entry_dist.get())
-        except ValueError:
-            d = 1
-        if d < 1:
-            d = 1
-        if d > d_max:
-            d = d_max
-        return d
-
     def update_corr_plots(self):
-        """Refresh both correlation plots in the main window."""
+        """Refresh both plots in the main window."""
         self.ax_corr_avg.clear()
         self.ax_corr_hist.clear()
 
-        if self.C_avg is None or self.C_values_by_dist is None or self.L is None:
+        if self.C_avg is None or self.L is None or self.gaps is None:
             # No data yet
-            self.ax_corr_avg.set_title("Ensemble-avg correlation (no data)")
-            self.ax_corr_avg.set_xlabel("|i - j|")
-            self.ax_corr_avg.set_ylabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$")
+            self.ax_corr_avg.set_title("Singlet-based correlation profile (no data)")
+            self.ax_corr_avg.set_xlabel("|i - j| (minimal distance on ring)")
+            self.ax_corr_avg.set_ylabel("C(r) = -3/4 · (singlets at distance r) / N")
 
-            self.ax_corr_hist.set_title("Distribution of C_ij (no data)")
-            self.ax_corr_hist.set_xlabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$")
+            self.ax_corr_hist.set_title("Gap distribution (no data)")
+            self.ax_corr_hist.set_xlabel("gap (last J_eff)")
             self.ax_corr_hist.set_ylabel("count")
 
             self.fig_corr.tight_layout()
@@ -461,54 +441,49 @@ class SDRGGroundStateGUI:
         distances = np.arange(1, d_max + 1)
         y = self.C_avg[1:d_max + 1]
 
-        # Top plot: <S_i·S_j> vs distance
+        # Top plot: C(r) vs distance
         self.ax_corr_avg.plot(distances, y, marker='o', linestyle='-')
         self.ax_corr_avg.set_xlabel("|i - j| along chain (minimal on ring)")
-        self.ax_corr_avg.set_ylabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$")
-        self.ax_corr_avg.set_title("Ensemble-averaged two-point correlations")
+        self.ax_corr_avg.set_ylabel("C(r) = -3/4 · (singlets at distance r) / N")
+        self.ax_corr_avg.set_title("Ensemble singlet-based 'correlation' profile")
 
-        # Bottom plot: histogram at a fixed distance
-        d_sel = self.get_selected_distance()
-        if d_sel is None:
-            self.ax_corr_hist.set_title("Distribution of C_ij (distance invalid)")
-            self.ax_corr_hist.set_xlabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$")
+        # Bottom plot: histogram of first excitation gaps
+        gaps = self.gaps
+        gaps_pos = gaps[gaps > 0]
+        nb = self.get_hist_bins()
+
+        if gaps_pos.size == 0:
+            self.ax_corr_hist.set_title("Gap distribution (no positive gaps)")
+            self.ax_corr_hist.set_xlabel("gap (last J_eff)")
             self.ax_corr_hist.set_ylabel("count")
         else:
-            vals = self.C_values_by_dist.get(d_sel, [])
-            if len(vals) == 0:
-                self.ax_corr_hist.set_title(f"Distribution of C_ij at |i-j|={d_sel} (no data)")
-                self.ax_corr_hist.set_xlabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$")
-                self.ax_corr_hist.set_ylabel("count")
-            else:
-                nb = self.get_hist_bins()
-                vmin, vmax = -0.75, 0.0
-                span = vmax - vmin
-                hist_min = vmin - 0.25 * span
-                hist_max = vmax + 0.25 * span
-                self.ax_corr_hist.hist(
-                    vals,
-                    bins=nb,
-                    range=(hist_min, hist_max),
-                    edgecolor='black',
-                    alpha=0.7
-                )
-                self.ax_corr_hist.set_xticks([-0.75, 0.0])
-                self.ax_corr_hist.set_xticklabels(["-3/4", "0"])
-                self.ax_corr_hist.set_xlabel(r"$\langle \mathbf{S}_i \cdot \mathbf{S}_j \rangle$ at fixed |i-j|")
-                self.ax_corr_hist.set_ylabel("count")
-                self.ax_corr_hist.set_title(f"Distribution of C_ij for |i-j| = {d_sel}")
+            g_min = float(gaps_pos.min())
+            g_max = float(gaps_pos.max())
+            if g_max == g_min:
+                g_min -= 0.5 * abs(g_min) if g_min != 0 else -0.5
+                g_max += 0.5 * abs(g_max) if g_max != 0 else 0.5
+            self.ax_corr_hist.hist(
+                gaps_pos,
+                bins=nb,
+                range=(g_min, g_max),
+                edgecolor='black',
+                alpha=0.7
+            )
+            self.ax_corr_hist.set_xlabel("First excitation gap (last J_eff)")
+            self.ax_corr_hist.set_ylabel("count")
+            self.ax_corr_hist.set_title("Distribution of first excitation gaps across ensemble")
 
-                vals_arr = np.array(vals)
-                p_singlet = float(np.mean(vals_arr == -0.75))
-                self.ax_corr_hist.text(
-                    0.02, 0.95,
-                    f"p_singlet ≈ {p_singlet:.3f}",
-                    transform=self.ax_corr_hist.transAxes,
-                    ha='left',
-                    va='top',
-                    fontsize=9,
-                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
-                )
+            # Annotate mean gap
+            mean_gap = float(np.mean(gaps_pos))
+            self.ax_corr_hist.text(
+                0.98, 0.95,
+                f"mean gap ≈ {mean_gap:.3g}",
+                transform=self.ax_corr_hist.transAxes,
+                ha='right',
+                va='top',
+                fontsize=9,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+            )
 
         self.fig_corr.tight_layout()
         self.canvas_corr.draw_idle()
