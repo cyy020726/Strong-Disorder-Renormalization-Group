@@ -134,7 +134,8 @@ class SDRGEnsembleGUI:
         self.frame_delay_ms = 400   # ms between animation frames
         self.shell_index_anim = 0   # which shell we are currently integrating
         self.anim_shell_phase = 0   # 0: highlight bond+neighbors; 1: show inserted bond
-        self.current_decimation = None  # (s, idx) for current decimation target
+        # current_decimation = ("normal" or "final", sample_index, center_index)
+        self.current_decimation = None
 
         # MODE: "animation" or "computation"
         self.mode_var = tk.StringVar(value="animation")
@@ -464,7 +465,6 @@ class SDRGEnsembleGUI:
             print("Sample an ensemble first.")
             return
         if not self.anim_running:
-            # Start from current state (or reset if you pressed Stop)
             self.anim_running = True
             self.anim_shell_phase = 0
             self.current_decimation = None
@@ -483,17 +483,19 @@ class SDRGEnsembleGUI:
 
     def on_compute(self):
         """
-        Batch mode: implement Ω-shell SDRG with fixed global RG time:
+        Batch mode: Ω-shell SDRG with final collapse.
 
         Ω_0 = max_{all bonds} J  (no rescaling)
         Ω_n = Ω_0 - n dΩ
 
-        Shell step n → n+1 integrates out the shell [Ω_{n+1}, Ω_n]:
-        For each chain separately:
-            while max(J_chain) >= Ω_{n+1} and len(chain) >= 3:
-                decimate the strongest bond.
+        For shell n we integrate the shell [Ω_{n+1}, Ω_n]:
+        For each chain s:
+            while len(chain) >= 3 and max(J_chain) >= Ω_{n+1}:
+                standard SDRG decimation
+            if len(chain) == 2 and max(J_chain) >= Ω_{n+1}:
+                final collapse: [J0, J1] -> [J0+J1]
 
-        We store snapshots after each shell.
+        We store snaps after each shell. Chains can reach length 1 earlier than others.
         """
         if self.mode_var.get() != "computation":
             print("Batch compute is only available in computation mode.")
@@ -512,7 +514,7 @@ class SDRGEnsembleGUI:
 
         dOmega = self.get_dOmega()
 
-        # Initialize chains from initial ensemble (do not touch animation chains)
+        # Initialize chains from initial ensemble
         M, L0 = self.J_init.shape
         chains = [list(self.J_init[s, :]) for s in range(M)]
 
@@ -526,7 +528,7 @@ class SDRGEnsembleGUI:
         self.Omega0 = Omega0
         self.current_Omega = Omega0
 
-        # Step 0: initial configuration at Ω_0
+        # Step 0 snapshot
         J0 = np.zeros((M, L0), dtype=float)
         for s, Js in enumerate(chains):
             J0[s, :] = np.array(Js, dtype=float)
@@ -564,6 +566,7 @@ class SDRGEnsembleGUI:
 
             for s in range(M):
                 J_list = chains[s]
+                # Standard decimations while len>=3 and Jmax >= Omega_low
                 if len(J_list) >= 3:
                     while len(J_list) >= 3:
                         arr = np.array(J_list, dtype=float)
@@ -572,6 +575,15 @@ class SDRGEnsembleGUI:
                             break
                         idx = int(arr.argmax())
                         J_list, _ = decimate_chain_nonrotating(J_list, idx)
+
+                # Final collapse [J0, J1] -> [J0+J1] if still in this shell
+                if len(J_list) == 2:
+                    arr = np.array(J_list, dtype=float)
+                    Jmax_chain = float(arr.max())
+                    if Jmax_chain >= Omega_low:
+                        J_total = J_list[0] + J_list[1]
+                        J_list = [J_total]
+
                 chains[s] = J_list
 
                 # Update per-shell chain completion progress
@@ -661,16 +673,21 @@ class SDRGEnsembleGUI:
         self.update_slider_info()
         self.update_hist_and_3d()
 
-    # --------------------------- Animation (Ω-shell + highlights) -----------------------------
+    # --------------------------- Animation (Ω-shell + highlights + final collapse) -----------
 
     def animate_shell(self):
         """
         Animation mode: each (pair of) frames corresponds to one decimation
         within the current shell [Ω_low, Ω_high].
 
-        Phase 0: pick a bond with J >= Ω_low, highlight it and its neighbors.
-        Phase 1: perform the decimation and highlight the inserted bond.
-        When no such bonds remain, advance to the next shell.
+        Phase 0: pick a bond to decimate in this shell:
+            - if len>=3: standard SDRG decimation (center + neighbors)
+            - if len==2: final collapse [J0,J1] -> [J0+J1]
+
+        Phase 1:
+            - apply the decimation/collapse, highlight inserted bond.
+        When no such bonds remain in this shell, advance to the next shell.
+        Chains that reach length 1 just sit there while others keep evolving.
         """
         if not self.anim_running:
             return
@@ -715,23 +732,36 @@ class SDRGEnsembleGUI:
         M = len(self.chains)
 
         if self.anim_shell_phase == 0:
-            # Phase 0: choose a bond to decimate in this shell and highlight it + neighbors
-            candidate = None
-            candidate_val = None
+            # Phase 0: choose a bond / pair to decimate/collapse in this shell
+            candidate = None      # (mode, s, idx)
+            candidate_val = None  # Jmax_chain
 
             for s, J_list in enumerate(self.chains):
+                if len(J_list) == 0:
+                    continue
+                arr = np.array(J_list, float)
+                Jmax_chain = float(arr.max())
+                if Jmax_chain < Omega_low:
+                    continue
+
                 if len(J_list) >= 3:
-                    arr = np.array(J_list, float)
-                    Jmax_chain = float(arr.max())
-                    if Jmax_chain >= Omega_low:
-                        idx = int(arr.argmax())
-                        if (candidate is None) or (Jmax_chain > candidate_val):
-                            candidate = (s, idx)
-                            candidate_val = Jmax_chain
+                    idx = int(arr.argmax())
+                    mode = "normal"
+                elif len(J_list) == 2:
+                    # final collapse candidate
+                    idx = 0  # dummy index
+                    mode = "final"
+                else:
+                    continue
+
+                if (candidate is None) or (Jmax_chain > candidate_val):
+                    candidate = (mode, s, idx)
+                    candidate_val = Jmax_chain
 
             if candidate is None:
                 # This shell is finished; move to next shell
                 self.shell_index_anim += 1
+
                 # Rebuild J_current from chains with zero padding
                 max_len = max((len(J_list) for J_list in self.chains), default=0)
                 if max_len <= 0:
@@ -753,14 +783,8 @@ class SDRGEnsembleGUI:
                 self.master.after(self.frame_delay_ms, self.animate_shell)
                 return
 
-            # Found a candidate bond to decimate
-            s, idx = candidate
+            mode, s, idx = candidate
             J_list = self.chains[s]
-            n_bonds = len(J_list)
-            left = (idx - 1) % n_bonds
-            right = (idx + 1) % n_bonds
-
-            self.current_decimation = (s, idx)
 
             # Build J_current (pre-decimation) with zero padding
             max_len = max((len(J_s) for J_s in self.chains), default=0)
@@ -774,10 +798,22 @@ class SDRGEnsembleGUI:
                         Jmat[ss, :len(J_s)] = np.array(J_s, dtype=float)
                 self.J_current = Jmat
 
-            # Highlight this bond + neighbors
-            self.last_decimated = [(s, idx)]
-            self.neighbor_bonds = [(s, left), (s, right)]
-            self.inserted_bonds = []
+            if mode == "normal":
+                n_bonds = len(J_list)
+                left = (idx - 1) % n_bonds
+                right = (idx + 1) % n_bonds
+
+                self.current_decimation = (mode, s, idx)
+                self.last_decimated = [(s, idx)]
+                self.neighbor_bonds = [(s, left), (s, right)]
+                self.inserted_bonds = []
+
+            else:  # mode == "final" for len==2
+                # highlight the two bonds as "decimated"
+                self.current_decimation = (mode, s, 0)
+                self.last_decimated = [(s, 0), (s, 1)]
+                self.neighbor_bonds = []
+                self.inserted_bonds = []
 
             self.update_hist_and_3d()
             self.anim_shell_phase = 1
@@ -785,41 +821,64 @@ class SDRGEnsembleGUI:
             return
 
         else:
-            # Phase 1: perform the decimation and highlight the inserted bond
+            # Phase 1: perform decimation/collapse and highlight inserted bond
             if self.current_decimation is None:
-                # Nothing to do, go back to phase 0
                 self.anim_shell_phase = 0
                 self.master.after(self.frame_delay_ms, self.animate_shell)
                 return
 
-            s, idx = self.current_decimation
+            mode, s, idx = self.current_decimation
             J_list = self.chains[s]
-            if len(J_list) >= 3:
-                new_J_list, new_idx = decimate_chain_nonrotating(J_list, idx)
-                self.chains[s] = new_J_list
-            else:
-                new_idx = None
 
-            # Rebuild J_current (post-decimation) with zero padding
-            M = len(self.chains)
-            max_len = max((len(J_s) for J_s in self.chains), default=0)
-            if max_len <= 0:
-                self.J_current = None
-            else:
-                Jmat = np.zeros((M, max_len), dtype=float)
-                for ss in range(M):
-                    J_s = self.chains[ss]
-                    if len(J_s) > 0:
-                        Jmat[ss, :len(J_s)] = np.array(J_s, dtype=float)
-                self.J_current = Jmat
+            if mode == "normal":
+                if len(J_list) >= 3:
+                    new_J_list, new_idx = decimate_chain_nonrotating(J_list, idx)
+                    self.chains[s] = new_J_list
+                else:
+                    new_idx = None
 
-            # Only the inserted bond is highlighted
-            self.last_decimated = []
-            self.neighbor_bonds = []
-            if new_idx is not None:
-                self.inserted_bonds = [(s, new_idx)]
-            else:
-                self.inserted_bonds = []
+                # Rebuild J_current (post-decimation)
+                M = len(self.chains)
+                max_len = max((len(J_s) for J_s in self.chains), default=0)
+                if max_len <= 0:
+                    self.J_current = None
+                else:
+                    Jmat = np.zeros((M, max_len), dtype=float)
+                    for ss in range(M):
+                        J_s = self.chains[ss]
+                        if len(J_s) > 0:
+                            Jmat[ss, :len(J_s)] = np.array(J_s, dtype=float)
+                    self.J_current = Jmat
+
+                self.last_decimated = []
+                self.neighbor_bonds = []
+                if new_idx is not None:
+                    self.inserted_bonds = [(s, new_idx)]
+                else:
+                    self.inserted_bonds = []
+
+            else:  # final collapse mode
+                if len(J_list) == 2:
+                    J_total = J_list[0] + J_list[1]
+                    new_J_list = [J_total]
+                    self.chains[s] = new_J_list
+                # Rebuild J_current (post-collapse)
+                M = len(self.chains)
+                max_len = max((len(J_s) for J_s in self.chains), default=0)
+                if max_len <= 0:
+                    self.J_current = None
+                else:
+                    Jmat = np.zeros((M, max_len), dtype=float)
+                    for ss in range(M):
+                        J_s = self.chains[ss]
+                        if len(J_s) > 0:
+                            Jmat[ss, :len(J_s)] = np.array(J_s, dtype=float)
+                    self.J_current = Jmat
+
+                self.last_decimated = []
+                self.neighbor_bonds = []
+                # New single bond is at index 0
+                self.inserted_bonds = [(s, 0)]
 
             self.update_hist_and_3d()
 
@@ -1119,7 +1178,7 @@ class SDRGEnsembleGUI:
         if Jmax <= 0:
             Jmax = 1.0
 
-        # Normalize heights against initial Ω0 (no rescaling to 1)
+        # Normalize heights against initial Ω0 (no rescaling Ω0 to 1)
         if self.Omega0 is not None and self.Omega0 > 0:
             norm_scale = self.Omega0
         else:
