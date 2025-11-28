@@ -112,11 +112,91 @@ def decimate_chain_nonrotating(J_s: list, b: int):
     return J_new, new_index
 
 
+# ====================== Master-equation helpers =======================
+
+def initial_pdf_unorm(J: np.ndarray, dist_name: str) -> np.ndarray:
+    """
+    Unnormalized *continuous* pdf ρ_0(J) corresponding to the GUI choice.
+    We later truncate to [0, Ω0] and renormalize numerically.
+    """
+    J = np.asarray(J, dtype=float)
+    f = np.zeros_like(J)
+
+    if dist_name == "Uniform(0,1)":
+        mask = (J >= 0.0) & (J <= 1.0)
+        f[mask] = 1.0
+    elif dist_name == "Exponential(λ=1)":
+        mask = J >= 0.0
+        f[mask] = np.exp(-J[mask])
+    elif dist_name == "Abs Gaussian N(0,1)":
+        mask = J >= 0.0
+        f[mask] = np.exp(-0.5 * J[mask] ** 2)
+    elif dist_name == "Log-normal(μ=0,σ=1)":
+        mask = J > 0.0
+        Jm = J[mask]
+        f[mask] = np.exp(-0.5 * (np.log(Jm) ** 2)) / Jm
+    elif dist_name == "Gamma(k=2,θ=1)":
+        mask = J >= 0.0
+        Jm = J[mask]
+        f[mask] = Jm * np.exp(-Jm)
+    elif dist_name == "Fermi-Dirac(μ=0,T=1)":
+        mask = J >= 0.0
+        Jm = J[mask]
+        f[mask] = 1.0 / (np.exp(Jm) + 1.0)
+    else:
+        # Fallback: exponential tail
+        mask = J >= 0.0
+        f[mask] = np.exp(-J[mask])
+
+    return f
+
+
+def evolve_zeta_step(P: np.ndarray, zeta: np.ndarray, dGamma: float) -> np.ndarray:
+    """
+    One small step in Γ for the SDRG master equation in ζ-space.
+
+    Uses a very simple explicit scheme for
+        ∂_Γ P = ∂_ζ P + P(0) [ (P * P)(ζ) - P(ζ) ].
+    This captures drift to larger ζ plus reshuffling via convolution.
+    """
+    P = np.asarray(P, dtype=float)
+    zeta = np.asarray(zeta, dtype=float)
+    if P.size < 2 or dGamma <= 0:
+        return P.copy()
+
+    dz = zeta[1] - zeta[0]
+    if dz <= 0:
+        return P.copy()
+
+    # Drift term: ∂_ζ P (upwind / backward difference)
+    dP_dz = np.zeros_like(P)
+    dP_dz[1:] = (P[1:] - P[:-1]) / dz
+    dP_dz[0] = dP_dz[1]
+
+    # Convolution term: (P * P)(ζ) via discrete convolution
+    P0 = max(P[0], 0.0)
+    conv_full = np.convolve(P, P) * dz  # length = 2N-1
+    conv = conv_full[: P.size]
+
+    rhs = dP_dz + P0 * (conv - P)
+
+    P_new = P + dGamma * rhs
+    P_new = np.maximum(P_new, 0.0)
+
+    norm = P_new.sum() * dz
+    if norm > 0:
+        P_new /= norm
+    else:
+        P_new.fill(1.0 / (P_new.size * dz))
+
+    return P_new
+
+
 # ================================ GUI Class ===================================
 
 class SDRGEnsembleGUI:
     def __init__(self, master):
-        self.master = master
+        self.master = master;
         master.title("SDRG ensemble — Ω-shell RG for ρ_Ω(J), P_Γ(ζ) + optional 3D view")
 
         # ---------- State ----------
@@ -128,6 +208,14 @@ class SDRGEnsembleGUI:
         self.Omega0 = None          # global Ω0 from initial ensemble
         self.current_Omega = None   # Ω for current snapshot (histograms + 3D label)
         self.dOmega_cached = 0.001  # last parsed dΩ
+        self.dist_name_current = None
+
+        # Store initial empirical samples for "shadow" histograms
+        self.J_init_pos = None
+
+        # Master-equation continuous solution
+        self.me_zeta_grid = None      # 1D grid in ζ
+        self.me_Pzeta_list = None     # list of arrays P(ζ, Γ_n), n = 0,1,...
 
         # Animation state (Ω-shell)
         self.anim_running = False
@@ -421,6 +509,68 @@ class SDRGEnsembleGUI:
             self.Omega0 = 0.0
         self.current_Omega = self.Omega0
 
+    def build_master_eq_solutions(self):
+        """
+        Build continuous master-equation solution P(ζ, Γ_n) starting from the
+        GUI's underlying continuous distribution, truncated at J ∈ [0, Ω0].
+        """
+        if self.Omega0 is None or self.Omega0 <= 0:
+            self.me_zeta_grid = None
+            self.me_Pzeta_list = None
+            return
+
+        dist_name = self.dist_name_current or self.combo_dist.get()
+        dOmega = self.get_dOmega()
+        try:
+            max_shells = int(self.entry_comp_steps.get())
+            if max_shells <= 0:
+                max_shells = 1
+        except ValueError:
+            max_shells = 1
+
+        # ζ-grid
+        Nz = 400
+        zmax = 10.0
+        zeta = np.linspace(0.0, zmax, Nz)
+        dz = zeta[1] - zeta[0]
+
+        # Initial profile in J-space from continuous pdf
+        J0 = self.Omega0 * np.exp(-zeta)  # J = Ω0 e^{-ζ}, ζ ≥ 0
+        f_un = initial_pdf_unorm(J0, dist_name)
+
+        # Map to ζ-space: P0(ζ) ∝ ρ0(J) * J
+        P0_un = f_un * J0
+        S = np.trapz(P0_un, zeta)
+        if S <= 0:
+            P0 = np.ones_like(zeta)
+        else:
+            P0 = P0_un / S
+
+        # Ensure normalization
+        S2 = np.trapz(P0, zeta)
+        if S2 > 0:
+            P0 /= S2
+
+        P_list = [P0]
+
+        # Evolve shell by shell in Γ, using Ω_n = Ω0 - n dΩ
+        Omega0 = self.Omega0
+        P_curr = P0
+        for n in range(max_shells):
+            Omega_high = Omega0 - n * dOmega
+            Omega_low = Omega_high - dOmega
+            if Omega_low <= 0 or Omega_high <= 0:
+                break
+            dGamma = np.log(Omega_high / Omega_low)
+            if dGamma <= 0:
+                break
+            P_next = evolve_zeta_step(P_curr, zeta, dGamma)
+            P_list.append(P_next)
+            P_curr = P_next
+
+        self.me_zeta_grid = zeta
+        self.me_Pzeta_list = P_list
+
     # ---------------------- Callbacks for controls -----------------------------
 
     def on_sample_ensemble(self):
@@ -440,9 +590,14 @@ class SDRGEnsembleGUI:
         # Sample raw couplings (no rescaling)
         J_raw = sample_couplings(L, M, dist_name, rng)
         self.J_init = J_raw.copy()
+        self.dist_name_current = dist_name
 
         # Reset animation state
         self.reset_from_initial()
+
+        # Store initial positive couplings for shadow histograms
+        J_flat = self.J_init.ravel()
+        self.J_init_pos = J_flat[J_flat > 0].copy()
 
         # Reset computation state
         self.comp_J_steps = None
@@ -454,6 +609,9 @@ class SDRGEnsembleGUI:
 
         self.progressbar_shells['value'] = 0
         self.progressbar_chains['value'] = 0
+
+        # Build continuous master-equation solution from continuous pdf
+        self.build_master_eq_solutions()
 
         self.update_hist_and_3d()
 
@@ -612,6 +770,9 @@ class SDRGEnsembleGUI:
         self.comp_J_steps = comp_J_steps
         self.comp_Omegas = comp_Omegas
         self.comp_index = 0
+
+        # (Re)build continuous master-equation solution for this Ω0, dΩ, and shell count
+        self.build_master_eq_solutions()
 
         # Slider configuration
         max_index = len(comp_J_steps) - 1
@@ -935,11 +1096,31 @@ class SDRGEnsembleGUI:
 
                 # ------------------ J histogram (density) ------------------
                 edges = np.linspace(0.0, Omega_plot, nbins + 1)
-                counts, edges = np.histogram(J_pos, bins=edges)
-                N = counts.sum()
                 widths = edges[1:] - edges[:-1]
                 centers = 0.5 * (edges[:-1] + edges[1:])
 
+                # Shadow: initial empirical J distribution
+                if self.J_init_pos is not None and self.J_init_pos.size > 0:
+                    J0 = self.J_init_pos[self.J_init_pos > 0]
+                    counts0, _ = np.histogram(J0, bins=edges)
+                    N0 = counts0.sum()
+                    if N0 > 0:
+                        heights0 = counts0 / (N0 * widths)
+                        self.ax_J.bar(
+                            centers,
+                            heights0,
+                            width=widths,
+                            align='center',
+                            alpha=0.25,
+                            color='#f4a3a3',
+                            edgecolor='none',
+                            label='Initial empirical (shadow)',
+                            zorder=0
+                        )
+
+                # Current histogram
+                counts, _ = np.histogram(J_pos, bins=edges)
+                N = counts.sum()
                 if N > 0:
                     heights = counts / (N * widths)
                 else:
@@ -953,29 +1134,62 @@ class SDRGEnsembleGUI:
                     alpha=0.7,
                     color='C0',
                     edgecolor='black',
-                    label='Empirical density (counts / (N·ΔJ))'
+                    label='Empirical density (counts / (N·ΔJ))',
+                    zorder=1
                 )
 
                 self.ax_J.set_xlabel("J (all bonds)")
                 self.ax_J.set_ylabel("probability density")
-                self.ax_J.set_title(r"Histogram (density) vs. theoretical $\rho_\Omega(J)$")
+                self.ax_J.set_title(r"Histogram (density) vs. theory + master eq")
 
-                # Lock histogram-determined limits
+                # Histogram-determined limits
                 xlim_J = self.ax_J.get_xlim()
                 ylim_J = self.ax_J.get_ylim()
 
                 # ------------------ ζ histogram (density) ------------------
+                # ζ (current data) = ln(Ω / J)
                 zeta = np.log(Omega_plot / J_pos)
                 zeta = np.maximum(zeta, 0.0)
-                zmax = float(zeta.max())
-                if zmax <= 0:
-                    zmax = 1.0
+                zmax_cur = float(zeta.max()) if zeta.size > 0 else 0.0
+
+                # ζ shadow from initial empirical distribution
+                zeta0 = None
+                zmax_init = 0.0
+                if self.J_init_pos is not None and self.J_init_pos.size > 0:
+                    J0_all = self.J_init_pos
+                    mask0 = (J0_all > 0) & (J0_all <= Omega_plot)
+                    if np.any(mask0):
+                        J0 = J0_all[mask0]
+                        zeta0 = np.log(Omega_plot / J0)
+                        zeta0 = np.maximum(zeta0, 0.0)
+                        zmax_init = float(zeta0.max()) if zeta0.size > 0 else 0.0
+
+                zmax = max(zmax_cur, zmax_init, 1.0)
                 edges_z = np.linspace(0.0, zmax, nbins + 1)
-                counts_z, edges_z = np.histogram(zeta, bins=edges_z)
-                N_z = counts_z.sum()
                 widths_z = edges_z[1:] - edges_z[:-1]
                 centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
 
+                # Shadow ζ-histogram (initial empirical)
+                if zeta0 is not None and zeta0.size > 0:
+                    counts_z0, _ = np.histogram(zeta0, bins=edges_z)
+                    N_z0 = counts_z0.sum()
+                    if N_z0 > 0:
+                        heights_z0 = counts_z0 / (N_z0 * widths_z)
+                        self.ax_zeta.bar(
+                            centers_z,
+                            heights_z0,
+                            width=widths_z,
+                            align='center',
+                            alpha=0.25,
+                            color='#f4a3a3',
+                            edgecolor='none',
+                            label='Initial empirical (shadow)',
+                            zorder=0
+                        )
+
+                # Current ζ-histogram
+                counts_z, _ = np.histogram(zeta, bins=edges_z)
+                N_z = counts_z.sum()
                 if N_z > 0:
                     heights_z = counts_z / (N_z * widths_z)
                 else:
@@ -989,18 +1203,19 @@ class SDRGEnsembleGUI:
                     alpha=0.7,
                     color='C1',
                     edgecolor='black',
-                    label='Empirical density (counts / (N·Δζ))'
+                    label='Empirical density (counts / (N·Δζ))',
+                    zorder=1
                 )
 
                 self.ax_zeta.set_xlabel(r'$\zeta = \ln(\Omega / J)$ (all bonds)')
                 self.ax_zeta.set_ylabel("probability density")
-                self.ax_zeta.set_title(r"Histogram (density) vs. theoretical $P_\Gamma(\zeta)$")
+                self.ax_zeta.set_title(r"Histogram (density) vs. theory + master eq")
 
-                # Lock histogram-determined limits for ζ
+                # Histogram-determined limits for ζ
                 xlim_z = self.ax_zeta.get_xlim()
                 ylim_z = self.ax_zeta.get_ylim()
 
-                # ------------------ Theoretical curves (do NOT set limits from them) ------------------
+                # ------------------ Theoretical asymptotic curves ------------------
                 if self.Omega0 is not None and self.Omega0 > 0 and 0 < Omega_plot < self.Omega0:
                     Gamma = np.log(self.Omega0 / Omega_plot)
                     if Gamma > 1e-8:
@@ -1014,7 +1229,7 @@ class SDRGEnsembleGUI:
                             rho_th,
                             'r-',
                             lw=2,
-                            label=r"Theory $\rho_\Omega(J)$ (density)"
+                            label=r"Asymptotic theory $\rho_\Omega(J)$",
                         )
 
                         # Theoretical P_Γ(ζ) = (1/Γ) e^{-ζ/Γ} on ζ ≥ 0
@@ -1025,7 +1240,7 @@ class SDRGEnsembleGUI:
                             P_th,
                             'r-',
                             lw=2,
-                            label=r"Theory $P_\Gamma(\zeta)$ (density)"
+                            label=r"Asymptotic theory $P_\Gamma(\zeta)$",
                         )
 
                         info_text = f"$\\Omega$={Omega_plot:.3g}\n$\\Gamma$={Gamma:.3g}"
@@ -1048,7 +1263,72 @@ class SDRGEnsembleGUI:
                             bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
                         )
 
-                # Restore histogram-based limits so theory can "shoot out" of the frame
+                # ------------------ Master-equation continuous curves ------------------
+                if self.me_zeta_grid is not None and self.me_Pzeta_list is not None:
+                    z_me = self.me_zeta_grid
+                    n = int(self.step_count)
+                    if 0 <= n < len(self.me_Pzeta_list):
+                        P_me = self.me_Pzeta_list[n]
+                        P0_me = self.me_Pzeta_list[0]
+
+                        # ζ-space curves
+                        mask_me = (z_me >= 0.0) & (z_me <= zmax)
+                        if np.any(mask_me):
+                            # Evolved distribution (green, dashed)
+                            self.ax_zeta.plot(
+                                z_me[mask_me],
+                                P_me[mask_me],
+                                color='green',
+                                linestyle='--',
+                                linewidth=2,
+                                label=r"Master eq $P(\zeta,\Gamma)$",
+                            )
+                            # Initial profile (orange)
+                            label_P0 = r"Initial $P_0(\zeta)$" if n == 0 else "_nolegend_"
+                            self.ax_zeta.plot(
+                                z_me[mask_me],
+                                P0_me[mask_me],
+                                color='orange',
+                                linestyle='-',
+                                linewidth=2,
+                                label=label_P0,
+                            )
+
+                        # J-space curves via J = Ω e^{-ζ}, ρ(J) = P(ζ)/J
+                        J_me = Omega_plot * np.exp(-z_me)
+                        denom = np.maximum(J_me, 1e-12)
+                        rho_me = P_me / denom
+                        rho0_me = P0_me / denom
+
+                        maskJ = (J_me > 0.0) & (J_me <= Omega_plot)
+                        if np.any(maskJ):
+                            J_me_plot = J_me[maskJ]
+                            rho_me_plot = rho_me[maskJ]
+                            rho0_me_plot = rho0_me[maskJ]
+                            order = np.argsort(J_me_plot)
+                            J_me_plot = J_me_plot[order]
+                            rho_me_plot = rho_me_plot[order]
+                            rho0_me_plot = rho0_me_plot[order]
+
+                            self.ax_J.plot(
+                                J_me_plot,
+                                rho_me_plot,
+                                color='green',
+                                linestyle='--',
+                                linewidth=2,
+                                label=r"Master eq $\rho_\Omega(J)$",
+                            )
+                            label_rho0 = r"Initial $\rho_0(J)$" if n == 0 else "_nolegend_"
+                            self.ax_J.plot(
+                                J_me_plot,
+                                rho0_me_plot,
+                                color='orange',
+                                linestyle='-',
+                                linewidth=2,
+                                label=label_rho0,
+                            )
+
+                # Restore histogram-based limits so theory + ME curves can shoot out of frame
                 self.ax_J.set_xlim(xlim_J)
                 self.ax_J.set_ylim(ylim_J)
                 self.ax_zeta.set_xlim(xlim_z)
