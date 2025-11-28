@@ -6,6 +6,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Polygon, Patch
+from scipy.signal import fftconvolve
 
 
 # ============================ Sampling helpers ============================
@@ -55,6 +56,66 @@ def sample_couplings(L: int, M: int, dist_name: str, rng: np.random.Generator) -
     else:
         J = rng.random((M, L))
     return J
+
+
+# ====================== Master equation helpers (ζ-space) =======================
+
+def shift_left(P, dx, dGamma):
+    """
+    Exact left shift by dGamma on a uniform grid of spacing dx:
+        P_shift(ζ) = P(ζ + dGamma),
+    with P=0 outside the original domain (ζ < 0 or ζ > ζ_max).
+    """
+    N = len(P)
+    x = np.arange(N) * dx  # ζ grid (0, dx, 2dx, ...)
+    return np.interp(x + dGamma, x, P, left=0.0, right=0.0)
+
+
+def evolve(P, x, dGamma):
+    """
+    Friend's evolution code, adapted with np.trapz instead of np.trapezoid.
+
+    P:  current pdf on ζ-grid x
+    x:  ζ-grid (uniform)
+    dGamma: small RG "time" step in Γ
+    """
+    dx = x[1] - x[0]
+
+    # -----------------------------
+    # Exact left shift by dGamma
+    # -----------------------------
+    P_shift = shift_left(P, dx, dGamma)
+
+    # -----------------------------
+    # Convolution term
+    # -----------------------------
+    P_conv = fftconvolve(P, P)[:len(x)] * dx
+
+    # Normalize P_conv
+    integral_conv = np.trapz(P_conv, x)
+    if integral_conv > 0:
+        P_conv /= integral_conv
+
+    # -----------------------------
+    # Integral of P from 0 to dGamma
+    # -----------------------------
+    mask = x <= dGamma
+    if np.any(mask):
+        A0 = np.trapz(P[mask], x[mask])
+    else:
+        A0 = 0.0
+
+    # -----------------------------
+    # Updated pdf
+    # -----------------------------
+    P_new = P_shift + A0 * P_conv
+    P_new = np.maximum(P_new, 0.0)
+
+    norm = np.trapz(P_new, x)
+    if norm > 0:
+        P_new /= norm
+
+    return P_new
 
 
 # ====================== Single-chain SDRG (non-rotating) =======================
@@ -112,91 +173,11 @@ def decimate_chain_nonrotating(J_s: list, b: int):
     return J_new, new_index
 
 
-# ====================== Master-equation helpers =======================
-
-def initial_pdf_unorm(J: np.ndarray, dist_name: str) -> np.ndarray:
-    """
-    Unnormalized *continuous* pdf ρ_0(J) corresponding to the GUI choice.
-    We later truncate to [0, Ω0] and renormalize numerically.
-    """
-    J = np.asarray(J, dtype=float)
-    f = np.zeros_like(J)
-
-    if dist_name == "Uniform(0,1)":
-        mask = (J >= 0.0) & (J <= 1.0)
-        f[mask] = 1.0
-    elif dist_name == "Exponential(λ=1)":
-        mask = J >= 0.0
-        f[mask] = np.exp(-J[mask])
-    elif dist_name == "Abs Gaussian N(0,1)":
-        mask = J >= 0.0
-        f[mask] = np.exp(-0.5 * J[mask] ** 2)
-    elif dist_name == "Log-normal(μ=0,σ=1)":
-        mask = J > 0.0
-        Jm = J[mask]
-        f[mask] = np.exp(-0.5 * (np.log(Jm) ** 2)) / Jm
-    elif dist_name == "Gamma(k=2,θ=1)":
-        mask = J >= 0.0
-        Jm = J[mask]
-        f[mask] = Jm * np.exp(-Jm)
-    elif dist_name == "Fermi-Dirac(μ=0,T=1)":
-        mask = J >= 0.0
-        Jm = J[mask]
-        f[mask] = 1.0 / (np.exp(Jm) + 1.0)
-    else:
-        # Fallback: exponential tail
-        mask = J >= 0.0
-        f[mask] = np.exp(-J[mask])
-
-    return f
-
-
-def evolve_zeta_step(P: np.ndarray, zeta: np.ndarray, dGamma: float) -> np.ndarray:
-    """
-    One small step in Γ for the SDRG master equation in ζ-space.
-
-    Uses a very simple explicit scheme for
-        ∂_Γ P = ∂_ζ P + P(0) [ (P * P)(ζ) - P(ζ) ].
-    This captures drift to larger ζ plus reshuffling via convolution.
-    """
-    P = np.asarray(P, dtype=float)
-    zeta = np.asarray(zeta, dtype=float)
-    if P.size < 2 or dGamma <= 0:
-        return P.copy()
-
-    dz = zeta[1] - zeta[0]
-    if dz <= 0:
-        return P.copy()
-
-    # Drift term: ∂_ζ P (upwind / backward difference)
-    dP_dz = np.zeros_like(P)
-    dP_dz[1:] = (P[1:] - P[:-1]) / dz
-    dP_dz[0] = dP_dz[1]
-
-    # Convolution term: (P * P)(ζ) via discrete convolution
-    P0 = max(P[0], 0.0)
-    conv_full = np.convolve(P, P) * dz  # length = 2N-1
-    conv = conv_full[: P.size]
-
-    rhs = dP_dz + P0 * (conv - P)
-
-    P_new = P + dGamma * rhs
-    P_new = np.maximum(P_new, 0.0)
-
-    norm = P_new.sum() * dz
-    if norm > 0:
-        P_new /= norm
-    else:
-        P_new.fill(1.0 / (P_new.size * dz))
-
-    return P_new
-
-
 # ================================ GUI Class ===================================
 
 class SDRGEnsembleGUI:
     def __init__(self, master):
-        self.master = master;
+        self.master = master
         master.title("SDRG ensemble — Ω-shell RG for ρ_Ω(J), P_Γ(ζ) + optional 3D view")
 
         # ---------- State ----------
@@ -208,14 +189,6 @@ class SDRGEnsembleGUI:
         self.Omega0 = None          # global Ω0 from initial ensemble
         self.current_Omega = None   # Ω for current snapshot (histograms + 3D label)
         self.dOmega_cached = 0.001  # last parsed dΩ
-        self.dist_name_current = None
-
-        # Store initial empirical samples for "shadow" histograms
-        self.J_init_pos = None
-
-        # Master-equation continuous solution
-        self.me_zeta_grid = None      # 1D grid in ζ
-        self.me_Pzeta_list = None     # list of arrays P(ζ, Γ_n), n = 0,1,...
 
         # Animation state (Ω-shell)
         self.anim_running = False
@@ -260,6 +233,15 @@ class SDRGEnsembleGUI:
 
         # Whether to show the 3D plot (toggle; default = False)
         self.show_3d = tk.BooleanVar(value=False)
+
+        # --------- Master equation in ζ-space ----------
+        self.zeta_grid = None      # 1D ζ-grid
+        self.P0_zeta = None        # initial P(ζ, Γ=0)
+        self.P_zeta = None         # current P(ζ, Γ)
+        self.Gamma_current = 0.0   # current Γ
+        # batch history
+        self.comp_Pzeta_steps = None
+        self.comp_Gammas = None
 
         # ======================= Layout: left/right =========================
         main_frame = ttk.Frame(master)
@@ -411,10 +393,19 @@ class SDRGEnsembleGUI:
         # Initial empty plots
         self.update_hist_and_3d()
 
+        # Set initial mode UI state (locks shells in animation)
+        self.on_mode_change()
+
     # ------------------------ Mode handling -----------------------------
 
     def on_mode_change(self):
-        if self.mode_var.get() != "animation":
+        mode = self.mode_var.get()
+        if mode == "animation":
+            # lock the number-of-shells input in animation mode
+            self.entry_comp_steps.configure(state='disabled')
+        else:
+            # in computation mode, allow editing #shells
+            self.entry_comp_steps.configure(state='normal')
             self.anim_running = False
 
     # ------------------------ 3D window helpers -----------------------------
@@ -479,9 +470,74 @@ class SDRGEnsembleGUI:
             nb = 40
         return nb
 
+    def initialize_master_equation(self):
+        """
+        Build the initial ζ-grid and P_0(ζ) from the *continuous* bare J-distribution
+        defined by the GUI choice, truncated to [0, Ω0].
+        """
+        if self.J_init is None or self.Omega0 is None or self.Omega0 <= 0:
+            self.zeta_grid = None
+            self.P0_zeta = None
+            self.P_zeta = None
+            self.Gamma_current = 0.0
+            return
+
+        Omega0 = self.Omega0
+        dist_name = self.combo_dist.get()
+
+        # ζ-grid (fixed for all Γ)
+        N_z = 1024
+        z_max = 10.0
+        z = np.linspace(0.0, z_max, N_z)
+        self.zeta_grid = z
+
+        def pdf_J_unnorm(J):
+            J = np.asarray(J)
+            if dist_name == "Uniform(0,1)":
+                return np.where((J >= 0.0) & (J <= 1.0), 1.0, 0.0)
+            elif dist_name == "Exponential(λ=1)":
+                return np.where(J >= 0.0, np.exp(-J), 0.0)
+            elif dist_name == "Abs Gaussian N(0,1)":
+                return np.where(J >= 0.0,
+                                np.sqrt(2.0 / np.pi) * np.exp(-0.5 * J**2),
+                                0.0)
+            elif dist_name == "Log-normal(μ=0,σ=1)":
+                out = np.zeros_like(J, dtype=float)
+                mask = J > 0
+                out[mask] = (1.0 / (J[mask] * np.sqrt(2.0 * np.pi))
+                             * np.exp(-0.5 * (np.log(J[mask]))**2))
+                return out
+            elif dist_name == "Gamma(k=2,θ=1)":
+                return np.where(J >= 0.0, J * np.exp(-J), 0.0)
+            elif dist_name == "Fermi-Dirac(μ=0,T=1)":
+                return np.where(J >= 0.0, 1.0 / (np.exp(J) + 1.0), 0.0)
+            else:
+                return np.where((J >= 0.0) & (J <= Omega0), 1.0, 0.0)
+
+        # Normalize on [0, Ω0]
+        J_grid_norm = np.linspace(0.0, Omega0, 2000)
+        Z = np.trapz(pdf_J_unnorm(J_grid_norm), J_grid_norm)
+        if Z <= 0:
+            Z = 1.0
+
+        # ρ_0(J) on J = Ω0 e^{-ζ}
+        J_from_z = Omega0 * np.exp(-z)
+        rho0 = pdf_J_unnorm(J_from_z) / Z
+
+        # P_0(ζ) = ρ_0(J) * |dJ/dζ| = ρ_0(J) * J
+        P0 = rho0 * J_from_z
+        norm_P0 = np.trapz(P0, z)
+        if norm_P0 > 0:
+            P0 /= norm_P0
+
+        self.P0_zeta = P0
+        self.P_zeta = P0.copy()
+        self.Gamma_current = 0.0
+
     def reset_from_initial(self):
         """
         Reset animation state to the initial ensemble (J_init), without resampling.
+        Also resets the master-equation state (Γ=0, P_0).
         """
         if self.J_init is None:
             return
@@ -509,67 +565,8 @@ class SDRGEnsembleGUI:
             self.Omega0 = 0.0
         self.current_Omega = self.Omega0
 
-    def build_master_eq_solutions(self):
-        """
-        Build continuous master-equation solution P(ζ, Γ_n) starting from the
-        GUI's underlying continuous distribution, truncated at J ∈ [0, Ω0].
-        """
-        if self.Omega0 is None or self.Omega0 <= 0:
-            self.me_zeta_grid = None
-            self.me_Pzeta_list = None
-            return
-
-        dist_name = self.dist_name_current or self.combo_dist.get()
-        dOmega = self.get_dOmega()
-        try:
-            max_shells = int(self.entry_comp_steps.get())
-            if max_shells <= 0:
-                max_shells = 1
-        except ValueError:
-            max_shells = 1
-
-        # ζ-grid
-        Nz = 400
-        zmax = 10.0
-        zeta = np.linspace(0.0, zmax, Nz)
-        dz = zeta[1] - zeta[0]
-
-        # Initial profile in J-space from continuous pdf
-        J0 = self.Omega0 * np.exp(-zeta)  # J = Ω0 e^{-ζ}, ζ ≥ 0
-        f_un = initial_pdf_unorm(J0, dist_name)
-
-        # Map to ζ-space: P0(ζ) ∝ ρ0(J) * J
-        P0_un = f_un * J0
-        S = np.trapz(P0_un, zeta)
-        if S <= 0:
-            P0 = np.ones_like(zeta)
-        else:
-            P0 = P0_un / S
-
-        # Ensure normalization
-        S2 = np.trapz(P0, zeta)
-        if S2 > 0:
-            P0 /= S2
-
-        P_list = [P0]
-
-        # Evolve shell by shell in Γ, using Ω_n = Ω0 - n dΩ
-        Omega0 = self.Omega0
-        P_curr = P0
-        for n in range(max_shells):
-            Omega_high = Omega0 - n * dOmega
-            Omega_low = Omega_high - dOmega
-            if Omega_low <= 0 or Omega_high <= 0:
-                break
-            dGamma = np.log(Omega_high / Omega_low)
-            if dGamma <= 0:
-                break
-            P_next = evolve_zeta_step(P_curr, zeta, dGamma)
-            P_list.append(P_next)
-            P_curr = P_next
-
-        self.me_zeta_grid = zeta
-        self.me_Pzeta_list = P_list
+        # Reset master equation (Γ=0, P_0)
+        self.initialize_master_equation()
 
     # ---------------------- Callbacks for controls -----------------------------
 
@@ -590,18 +587,15 @@ class SDRGEnsembleGUI:
         # Sample raw couplings (no rescaling)
         J_raw = sample_couplings(L, M, dist_name, rng)
         self.J_init = J_raw.copy()
-        self.dist_name_current = dist_name
 
-        # Reset animation state
+        # Reset animation + master equation
         self.reset_from_initial()
-
-        # Store initial positive couplings for shadow histograms
-        J_flat = self.J_init.ravel()
-        self.J_init_pos = J_flat[J_flat > 0].copy()
 
         # Reset computation state
         self.comp_J_steps = None
         self.comp_Omegas = None
+        self.comp_Pzeta_steps = None
+        self.comp_Gammas = None
         self.comp_index = 0
         self.slider.configure(state='disabled', from_=0, to=0)
         self.slider.set(0)
@@ -609,9 +603,6 @@ class SDRGEnsembleGUI:
 
         self.progressbar_shells['value'] = 0
         self.progressbar_chains['value'] = 0
-
-        # Build continuous master-equation solution from continuous pdf
-        self.build_master_eq_solutions()
 
         self.update_hist_and_3d()
 
@@ -641,19 +632,7 @@ class SDRGEnsembleGUI:
 
     def on_compute(self):
         """
-        Batch mode: Ω-shell SDRG with final collapse.
-
-        Ω_0 = max_{all bonds} J  (no rescaling)
-        Ω_n = Ω_0 - n dΩ
-
-        For shell n we integrate the shell [Ω_{n+1}, Ω_n]:
-        For each chain s:
-            while len(chain) >= 3 and max(J_chain) >= Ω_{n+1}:
-                standard SDRG decimation
-            if len(chain) == 2 and max(J_chain) >= Ω_{n+1}:
-                final collapse: [J0, J1] -> [J0+J1]
-
-        We store snaps after each shell. Chains can reach length 1 earlier than others.
+        Batch mode: Ω-shell SDRG with final collapse + master-equation evolution.
         """
         if self.mode_var.get() != "computation":
             print("Batch compute is only available in computation mode.")
@@ -685,6 +664,15 @@ class SDRGEnsembleGUI:
             Omega0 = 0.0
         self.Omega0 = Omega0
         self.current_Omega = Omega0
+
+        # (Re)initialize master equation
+        self.initialize_master_equation()
+        if self.zeta_grid is not None and self.P_zeta is not None:
+            comp_Pzeta = [self.P_zeta.copy()]
+            comp_Gammas = [0.0]
+        else:
+            comp_Pzeta = None
+            comp_Gammas = None
 
         # Step 0 snapshot
         J0 = np.zeros((M, L0), dtype=float)
@@ -762,6 +750,16 @@ class SDRGEnsembleGUI:
             comp_J_steps.append(Jmat)
             comp_Omegas.append(Omega_low)
 
+            # Master equation: evolve by dΓ_shell = ln(Ω_high/Ω_low)
+            if comp_Pzeta is not None and comp_Gammas is not None and \
+               self.zeta_grid is not None and self.P_zeta is not None:
+                dGamma_shell = np.log(Omega_high / Omega_low)
+                if dGamma_shell > 0:
+                    self.P_zeta = evolve(self.P_zeta, self.zeta_grid, dGamma_shell)
+                    self.Gamma_current = comp_Gammas[-1] + dGamma_shell
+                comp_Pzeta.append(self.P_zeta.copy())
+                comp_Gammas.append(self.Gamma_current)
+
             # Update shells progress bar
             self.progressbar_shells['value'] = n + 1
             self.master.update_idletasks()
@@ -769,10 +767,9 @@ class SDRGEnsembleGUI:
         # Store computation results
         self.comp_J_steps = comp_J_steps
         self.comp_Omegas = comp_Omegas
+        self.comp_Pzeta_steps = comp_Pzeta
+        self.comp_Gammas = comp_Gammas
         self.comp_index = 0
-
-        # (Re)build continuous master-equation solution for this Ω0, dΩ, and shell count
-        self.build_master_eq_solutions()
 
         # Slider configuration
         max_index = len(comp_J_steps) - 1
@@ -783,6 +780,14 @@ class SDRGEnsembleGUI:
         self.J_current = comp_J_steps[0]
         self.current_Omega = comp_Omegas[0] if len(comp_Omegas) > 0 else None
         self.step_count = 0
+
+        # Reset P_zeta, Gamma_current to the first snapshot
+        if self.comp_Pzeta_steps is not None and len(self.comp_Pzeta_steps) > 0:
+            self.P_zeta = self.comp_Pzeta_steps[0].copy()
+        if self.comp_Gammas is not None and len(self.comp_Gammas) > 0:
+            self.Gamma_current = self.comp_Gammas[0]
+        else:
+            self.Gamma_current = 0.0
 
         # Clear highlights
         self.last_decimated = []
@@ -801,8 +806,15 @@ class SDRGEnsembleGUI:
             self.slider_info_label.config(text="Slider index out of range.")
             return
         Omega_cur = self.comp_Omegas[idx]
-        if self.Omega0 is not None and self.Omega0 > 0 and Omega_cur > 0:
+
+        if self.comp_Gammas is not None and idx < len(self.comp_Gammas):
+            Gamma = self.comp_Gammas[idx]
+        elif self.Omega0 is not None and self.Omega0 > 0 and Omega_cur > 0:
             Gamma = np.log(self.Omega0 / Omega_cur)
+        else:
+            Gamma = None
+
+        if Gamma is not None:
             self.slider_info_label.config(
                 text=f"Shell/state index = {idx},  Ω = {Omega_cur:.3g},  Γ = {Gamma:.3g}"
             )
@@ -826,6 +838,18 @@ class SDRGEnsembleGUI:
         self.current_Omega = self.comp_Omegas[idx]
         self.step_count = idx
 
+        # Update master-equation state to this snapshot
+        if self.comp_Pzeta_steps is not None and idx < len(self.comp_Pzeta_steps):
+            self.P_zeta = self.comp_Pzeta_steps[idx].copy()
+        if self.comp_Gammas is not None and idx < len(self.comp_Gammas):
+            self.Gamma_current = self.comp_Gammas[idx]
+        else:
+            if self.Omega0 is not None and self.Omega0 > 0 and \
+               self.current_Omega is not None and self.current_Omega > 0:
+                self.Gamma_current = np.log(self.Omega0 / self.current_Omega)
+            else:
+                self.Gamma_current = 0.0
+
         # Clear any highlights
         self.last_decimated = []
         self.neighbor_bonds = []
@@ -839,22 +863,40 @@ class SDRGEnsembleGUI:
     def animate_shell(self):
         """
         Animation mode: each (pair of) frames corresponds to one decimation
-        within the current shell [Ω_low, Ω_high].
-
-        Phase 0: pick a bond to decimate in this shell:
-            - if len>=3: standard SDRG decimation (center + neighbors)
-            - if len==2: final collapse [J0,J1] -> [J0+J1]
-
-        Phase 1:
-            - apply the decimation/collapse, highlight inserted bond.
-        When no such bonds remain in this shell, advance to the next shell.
-        Chains that reach length 1 just sit there while others keep evolving.
+        within the current shell [Ω_low, Ω_high]. Continues until all chains
+        have at most one bond.
         """
         if not self.anim_running:
             return
         if self.mode_var.get() != "animation":
             return
         if self.chains is None or len(self.chains) == 0:
+            self.anim_running = False
+            return
+
+        # Stop when all chains have at most one bond
+        if all(len(J_s) <= 1 for J_s in self.chains):
+            # Rebuild final rectangular matrix
+            M = len(self.chains)
+            max_len = max((len(J_s) for J_s in self.chains), default=0)
+            if max_len <= 0:
+                self.J_current = None
+                self.current_Omega = 0.0
+            else:
+                Jmat = np.zeros((M, max_len), dtype=float)
+                for s in range(M):
+                    J_s = self.chains[s]
+                    if len(J_s) > 0:
+                        Jmat[s, :len(J_s)] = np.array(J_s, dtype=float)
+                self.J_current = Jmat
+                all_J = Jmat.ravel()
+                J_pos = all_J[all_J > 0]
+                self.current_Omega = float(J_pos.max()) if J_pos.size > 0 else 0.0
+
+            self.last_decimated = []
+            self.neighbor_bonds = []
+            self.inserted_bonds = []
+            self.update_hist_and_3d()
             self.anim_running = False
             return
 
@@ -867,18 +909,6 @@ class SDRGEnsembleGUI:
             self.anim_running = False
             return
 
-        # How many shells to animate (reuse batch input)
-        try:
-            max_shells = int(self.entry_comp_steps.get())
-            if max_shells <= 0:
-                max_shells = 1
-        except ValueError:
-            max_shells = 1
-
-        if self.shell_index_anim >= max_shells:
-            self.anim_running = False
-            return
-
         n = self.shell_index_anim
         Omega_high = self.Omega0 - n * dOmega
         Omega_low = Omega_high - dOmega
@@ -887,6 +917,7 @@ class SDRGEnsembleGUI:
             self.anim_running = False
             return
 
+        # For labeling
         self.current_Omega = Omega_high
         self.step_count = n
 
@@ -909,8 +940,7 @@ class SDRGEnsembleGUI:
                     idx = int(arr.argmax())
                     mode = "normal"
                 elif len(J_list) == 2:
-                    # final collapse candidate
-                    idx = 0  # dummy index
+                    idx = 0  # dummy index for final collapse
                     mode = "final"
                 else:
                     continue
@@ -920,13 +950,21 @@ class SDRGEnsembleGUI:
                     candidate_val = Jmax_chain
 
             if candidate is None:
-                # This shell is finished; move to next shell
+                # This shell is finished; evolve master equation for this shell
+                dGamma_shell = np.log(Omega_high / Omega_low)
+                if (self.zeta_grid is not None and self.P_zeta is not None
+                        and dGamma_shell > 0):
+                    self.P_zeta = evolve(self.P_zeta, self.zeta_grid, dGamma_shell)
+                    self.Gamma_current += dGamma_shell
+
+                # Move to next shell
                 self.shell_index_anim += 1
 
                 # Rebuild J_current from chains with zero padding
                 max_len = max((len(J_list) for J_list in self.chains), default=0)
                 if max_len <= 0:
                     self.J_current = None
+                    self.current_Omega = 0.0
                 else:
                     Jmat = np.zeros((M, max_len), dtype=float)
                     for s in range(M):
@@ -934,6 +972,9 @@ class SDRGEnsembleGUI:
                         if len(J_list) > 0:
                             Jmat[s, :len(J_list)] = np.array(J_list, dtype=float)
                     self.J_current = Jmat
+                    all_J = Jmat.ravel()
+                    J_pos = all_J[all_J > 0]
+                    self.current_Omega = float(J_pos.max()) if J_pos.size > 0 else Omega_low
 
                 # Clear highlights
                 self.last_decimated = []
@@ -1099,26 +1140,6 @@ class SDRGEnsembleGUI:
                 widths = edges[1:] - edges[:-1]
                 centers = 0.5 * (edges[:-1] + edges[1:])
 
-                # Shadow: initial empirical J distribution
-                if self.J_init_pos is not None and self.J_init_pos.size > 0:
-                    J0 = self.J_init_pos[self.J_init_pos > 0]
-                    counts0, _ = np.histogram(J0, bins=edges)
-                    N0 = counts0.sum()
-                    if N0 > 0:
-                        heights0 = counts0 / (N0 * widths)
-                        self.ax_J.bar(
-                            centers,
-                            heights0,
-                            width=widths,
-                            align='center',
-                            alpha=0.25,
-                            color='#f4a3a3',
-                            edgecolor='none',
-                            label='Initial empirical (shadow)',
-                            zorder=0
-                        )
-
-                # Current histogram
                 counts, _ = np.histogram(J_pos, bins=edges)
                 N = counts.sum()
                 if N > 0:
@@ -1126,6 +1147,7 @@ class SDRGEnsembleGUI:
                 else:
                     heights = np.zeros_like(widths)
 
+                # Main empirical histogram
                 self.ax_J.bar(
                     centers,
                     heights,
@@ -1135,59 +1157,27 @@ class SDRGEnsembleGUI:
                     color='C0',
                     edgecolor='black',
                     label='Empirical density (counts / (N·ΔJ))',
-                    zorder=1
+                    zorder=2.0,
                 )
 
                 self.ax_J.set_xlabel("J (all bonds)")
                 self.ax_J.set_ylabel("probability density")
-                self.ax_J.set_title(r"Histogram (density) vs. theory + master eq")
+                self.ax_J.set_title(r"Histogram (density) vs. theoretical $\rho_\Omega(J)$")
 
-                # Histogram-determined limits
+                # Lock histogram-determined limits (current state only)
                 xlim_J = self.ax_J.get_xlim()
                 ylim_J = self.ax_J.get_ylim()
 
                 # ------------------ ζ histogram (density) ------------------
-                # ζ (current data) = ln(Ω / J)
                 zeta = np.log(Omega_plot / J_pos)
                 zeta = np.maximum(zeta, 0.0)
-                zmax_cur = float(zeta.max()) if zeta.size > 0 else 0.0
-
-                # ζ shadow from initial empirical distribution
-                zeta0 = None
-                zmax_init = 0.0
-                if self.J_init_pos is not None and self.J_init_pos.size > 0:
-                    J0_all = self.J_init_pos
-                    mask0 = (J0_all > 0) & (J0_all <= Omega_plot)
-                    if np.any(mask0):
-                        J0 = J0_all[mask0]
-                        zeta0 = np.log(Omega_plot / J0)
-                        zeta0 = np.maximum(zeta0, 0.0)
-                        zmax_init = float(zeta0.max()) if zeta0.size > 0 else 0.0
-
-                zmax = max(zmax_cur, zmax_init, 1.0)
+                zmax = float(zeta.max())
+                if zmax <= 0:
+                    zmax = 1.0
                 edges_z = np.linspace(0.0, zmax, nbins + 1)
                 widths_z = edges_z[1:] - edges_z[:-1]
                 centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
 
-                # Shadow ζ-histogram (initial empirical)
-                if zeta0 is not None and zeta0.size > 0:
-                    counts_z0, _ = np.histogram(zeta0, bins=edges_z)
-                    N_z0 = counts_z0.sum()
-                    if N_z0 > 0:
-                        heights_z0 = counts_z0 / (N_z0 * widths_z)
-                        self.ax_zeta.bar(
-                            centers_z,
-                            heights_z0,
-                            width=widths_z,
-                            align='center',
-                            alpha=0.25,
-                            color='#f4a3a3',
-                            edgecolor='none',
-                            label='Initial empirical (shadow)',
-                            zorder=0
-                        )
-
-                # Current ζ-histogram
                 counts_z, _ = np.histogram(zeta, bins=edges_z)
                 N_z = counts_z.sum()
                 if N_z > 0:
@@ -1204,46 +1194,46 @@ class SDRGEnsembleGUI:
                     color='C1',
                     edgecolor='black',
                     label='Empirical density (counts / (N·Δζ))',
-                    zorder=1
+                    zorder=2.0,
                 )
 
                 self.ax_zeta.set_xlabel(r'$\zeta = \ln(\Omega / J)$ (all bonds)')
                 self.ax_zeta.set_ylabel("probability density")
-                self.ax_zeta.set_title(r"Histogram (density) vs. theory + master eq")
+                self.ax_zeta.set_title(r"Histogram (density) vs. theoretical $P_\Gamma(\zeta)$")
 
-                # Histogram-determined limits for ζ
+                # Lock histogram-determined limits for ζ
                 xlim_z = self.ax_zeta.get_xlim()
                 ylim_z = self.ax_zeta.get_ylim()
 
                 # ------------------ Theoretical asymptotic curves ------------------
                 if self.Omega0 is not None and self.Omega0 > 0 and 0 < Omega_plot < self.Omega0:
-                    Gamma = np.log(self.Omega0 / Omega_plot)
-                    if Gamma > 1e-8:
+                    Gamma_th = np.log(self.Omega0 / Omega_plot)
+                    if Gamma_th > 1e-8:
                         # Theoretical ρ_Ω(J)
                         J_min_data = float(J_pos.min())
                         J_min_grid = max(J_min_data, Omega_plot * 1e-4)
                         J_grid = np.linspace(J_min_grid, Omega_plot, 400)
-                        rho_th = (1.0 / (Omega_plot * Gamma)) * (Omega_plot / J_grid) ** (1.0 - 1.0 / Gamma)
+                        rho_th = (1.0 / (Omega_plot * Gamma_th)) * (Omega_plot / J_grid) ** (1.0 - 1.0 / Gamma_th)
                         self.ax_J.plot(
                             J_grid,
                             rho_th,
                             'r-',
                             lw=2,
-                            label=r"Asymptotic theory $\rho_\Omega(J)$",
+                            label=r"Theory $\rho_\Omega(J)$ (density)"
                         )
 
                         # Theoretical P_Γ(ζ) = (1/Γ) e^{-ζ/Γ} on ζ ≥ 0
                         z_grid = np.linspace(0.0, zmax, 400)
-                        P_th = (1.0 / Gamma) * np.exp(-z_grid / Gamma)
+                        P_th = (1.0 / Gamma_th) * np.exp(-z_grid / Gamma_th)
                         self.ax_zeta.plot(
                             z_grid,
                             P_th,
                             'r-',
                             lw=2,
-                            label=r"Asymptotic theory $P_\Gamma(\zeta)$",
+                            label=r"Theory $P_\Gamma(\zeta)$ (density)"
                         )
 
-                        info_text = f"$\\Omega$={Omega_plot:.3g}\n$\\Gamma$={Gamma:.3g}"
+                        info_text = f"$\\Omega$={Omega_plot:.3g}\n$\\Gamma$={Gamma_th:.3g}"
                         self.ax_J.text(
                             0.98, 0.95,
                             info_text,
@@ -1263,72 +1253,40 @@ class SDRGEnsembleGUI:
                             bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
                         )
 
-                # ------------------ Master-equation continuous curves ------------------
-                if self.me_zeta_grid is not None and self.me_Pzeta_list is not None:
-                    z_me = self.me_zeta_grid
-                    n = int(self.step_count)
-                    if 0 <= n < len(self.me_Pzeta_list):
-                        P_me = self.me_Pzeta_list[n]
-                        P0_me = self.me_Pzeta_list[0]
+                # ------------------ Master-equation prediction overlay ------------------
+                if self.zeta_grid is not None and self.P_zeta is not None and Omega_plot > 0:
+                    z = self.zeta_grid
+                    Pz = self.P_zeta
 
-                        # ζ-space curves
-                        mask_me = (z_me >= 0.0) & (z_me <= zmax)
-                        if np.any(mask_me):
-                            # Evolved distribution (green, dashed)
-                            self.ax_zeta.plot(
-                                z_me[mask_me],
-                                P_me[mask_me],
-                                color='green',
-                                linestyle='--',
-                                linewidth=2,
-                                label=r"Master eq $P(\zeta,\Gamma)$",
-                            )
-                            # Initial profile (orange)
-                            label_P0 = r"Initial $P_0(\zeta)$" if n == 0 else "_nolegend_"
-                            self.ax_zeta.plot(
-                                z_me[mask_me],
-                                P0_me[mask_me],
-                                color='orange',
-                                linestyle='-',
-                                linewidth=2,
-                                label=label_P0,
-                            )
+                    # ζ-space line (green) up to current zmax
+                    mask_me_z = z <= zmax
+                    if np.any(mask_me_z):
+                        self.ax_zeta.plot(
+                            z[mask_me_z],
+                            Pz[mask_me_z],
+                            color='g',
+                            lw=2,
+                            label="Master eq $P(\\zeta)$"
+                        )
 
-                        # J-space curves via J = Ω e^{-ζ}, ρ(J) = P(ζ)/J
-                        J_me = Omega_plot * np.exp(-z_me)
-                        denom = np.maximum(J_me, 1e-12)
-                        rho_me = P_me / denom
-                        rho0_me = P0_me / denom
+                    # J-space prediction ρ(J) from same P(ζ), with J = Ω e^{-ζ}
+                    J_me = Omega_plot * np.exp(-z)
+                    mask_me_J = (J_me > 0) & (J_me <= Omega_plot)
+                    if np.any(mask_me_J):
+                        J_line = J_me[mask_me_J]
+                        rho_line = Pz[mask_me_J] / np.maximum(J_line, 1e-300)
+                        order = np.argsort(J_line)
+                        J_line = J_line[order]
+                        rho_line = rho_line[order]
+                        self.ax_J.plot(
+                            J_line,
+                            rho_line,
+                            color='g',
+                            lw=2,
+                            label="Master eq $\\rho(J)$"
+                        )
 
-                        maskJ = (J_me > 0.0) & (J_me <= Omega_plot)
-                        if np.any(maskJ):
-                            J_me_plot = J_me[maskJ]
-                            rho_me_plot = rho_me[maskJ]
-                            rho0_me_plot = rho0_me[maskJ]
-                            order = np.argsort(J_me_plot)
-                            J_me_plot = J_me_plot[order]
-                            rho_me_plot = rho_me_plot[order]
-                            rho0_me_plot = rho0_me_plot[order]
-
-                            self.ax_J.plot(
-                                J_me_plot,
-                                rho_me_plot,
-                                color='green',
-                                linestyle='--',
-                                linewidth=2,
-                                label=r"Master eq $\rho_\Omega(J)$",
-                            )
-                            label_rho0 = r"Initial $\rho_0(J)$" if n == 0 else "_nolegend_"
-                            self.ax_J.plot(
-                                J_me_plot,
-                                rho0_me_plot,
-                                color='orange',
-                                linestyle='-',
-                                linewidth=2,
-                                label=label_rho0,
-                            )
-
-                # Restore histogram-based limits so theory + ME curves can shoot out of frame
+                # Restore histogram-based limits so theory/ME curves don't change axes
                 self.ax_J.set_xlim(xlim_J)
                 self.ax_J.set_ylim(ylim_J)
                 self.ax_zeta.set_xlim(xlim_z)
