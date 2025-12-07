@@ -373,3 +373,16 @@ if __name__ == "__main__":
     
     # Plot the activated scaling
     plot_fisher_gap_scaling(L_list, gaps_list)
+
+    L = 300
+    M = 2000
+    gaps, all_lengths, all_omegas, L0 = sdrg_ensemble(
+        L, M, dist_name="Uniform(0,1)", seed=0, store_all_events=True
+    )
+    
+    r_vals, C_r = avg_correlations_from_singlets(all_lengths, L0, M)
+    
+    plot_gap_distribution(gaps)
+    plot_length_vs_energy(all_lengths, all_omegas)
+    plot_fisher_scaling(all_lengths, all_omegas)
+    plot_correlations(r_vals, C_r)
