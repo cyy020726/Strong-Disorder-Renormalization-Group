@@ -196,7 +196,7 @@ def plot_distance_pdf_flow(d_per_bin, labels, nbins=30):
     
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
-    N_sites = 64
+    N_sites = 256
     n_realizations = 200
 
     # collect decimated distances for uniform initial distances
