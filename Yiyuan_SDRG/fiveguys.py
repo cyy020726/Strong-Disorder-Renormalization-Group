@@ -1,12 +1,13 @@
 import numpy as np
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Polygon, Patch
 from scipy.signal import fftconvolve
+import os
 
 
 # ============================ Sampling helpers ============================
@@ -337,6 +338,10 @@ class SDRGEnsembleGUI:
         self.button_stop = ttk.Button(control_frame, text="Stop", command=self.on_stop)
         self.button_stop.grid(row=5, column=3, padx=2, pady=4, sticky="ew")
 
+        # NEW: Save plots button
+        self.button_save = ttk.Button(control_frame, text="Save plots", command=self.on_save_plots)
+        self.button_save.grid(row=5, column=4, padx=2, pady=4, sticky="ew")
+
         # Current shell / state label
         self.step_label = ttk.Label(self.left_frame, text="Current shell (n): 0")
         self.step_label.pack(side=tk.TOP, anchor="w", pady=(4, 4))
@@ -627,6 +632,59 @@ class SDRGEnsembleGUI:
         if self.mode_var.get() == "animation":
             self.reset_from_initial()
             self.update_hist_and_3d()
+
+    def on_save_plots(self):
+        """
+        Save the current histogram figure, and if the 3D figure exists,
+        save that as well. Uses a single base filename chosen via a
+        file dialog, and appends '_3D' for the 3D plot.
+        """
+        if self.fig_hist is None:
+            messagebox.showinfo("Save plots", "No histogram figure to save.")
+            return
+
+        # Ask for base filename for the histogram
+        default_name = "histograms.png"
+        filetypes = [
+            ("PNG image", "*.png"),
+            ("PDF file", "*.pdf"),
+            ("SVG file", "*.svg"),
+            ("All files", "*.*"),
+        ]
+
+        filename = filedialog.asksaveasfilename(
+            title="Save histogram figure",
+            defaultextension=".png",
+            initialfile=default_name,
+            filetypes=filetypes,
+        )
+
+        if not filename:
+            return  # user cancelled
+
+        # Save histogram figure
+        try:
+            self.fig_hist.savefig(filename, dpi=300, bbox_inches="tight")
+        except Exception as e:
+            messagebox.showerror("Save plots", f"Failed to save histogram figure:\n{e}")
+            return
+
+        saved_files = [filename]
+
+        # If 3D figure exists, save it next to the histogram with a suffix
+        if self.fig3d is not None:
+            base, ext = os.path.splitext(filename)
+            filename_3d = base + "_3D" + (ext if ext else ".png")
+            try:
+                self.fig3d.savefig(filename_3d, dpi=300, bbox_inches="tight")
+                saved_files.append(filename_3d)
+            except Exception as e:
+                messagebox.showerror("Save plots", f"Histogram saved.\nFailed to save 3D figure:\n{e}")
+                return
+
+        # Show confirmation
+        msg = "Saved:\n" + "\n".join(saved_files)
+        messagebox.showinfo("Save plots", msg)
 
     # ------------------------ Computation mode (Ω-shell SDRG) ------------------------
 
@@ -1294,7 +1352,7 @@ class SDRGEnsembleGUI:
 
                 self.ax_J.text(
                     0.02, 0.95,
-                    f"Shell n = {self.step_count}",
+                    f"Shell l = {self.step_count}",
                     transform=self.ax_J.transAxes,
                     ha='left',
                     va='top',
