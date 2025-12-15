@@ -1,11 +1,13 @@
 import numpy as np
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+import os
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +209,12 @@ class SDRGGroundStateGUI:
         self.batch_L_list = None         # list of sizes
         self.batch_gaps_list = None      # list of arrays (M,)
 
+        # -------- gap scaling window --------
+        self.gap_window = None
+        self.gap_fig = None
+        self.gap_ax = None
+        self.gap_canvas = None
+
         # -------- build UI --------
         self._build_layout()
 
@@ -307,6 +315,12 @@ class SDRGGroundStateGUI:
         self.progress_single.grid(row=3, column=0, columnspan=4,
                                   padx=4, pady=(0, 4), sticky="ew")
 
+        # NEW: Save plots for the main figure
+        self.btn_save_main = ttk.Button(self.single_frame, text="Save plots",
+                                        command=self.on_save_plots_main)
+        self.btn_save_main.grid(row=4, column=0, columnspan=4,
+                                padx=4, pady=(2, 4), sticky="ew")
+
         # ----- Batch compute controls -----
         self.batch_frame = ttk.LabelFrame(self.left_frame,
                                           text="Batch compute parameters")
@@ -374,6 +388,84 @@ class SDRGGroundStateGUI:
         self.on_mode_changed()
 
     # ------------------------------------------------------------------
+    # Save plots helpers
+    # ------------------------------------------------------------------
+
+    def _save_figure_via_dialog(self, fig, title="Save figure", initialfile="figure.png"):
+        if fig is None:
+            messagebox.showinfo("Save plots", "No figure available to save.")
+            return None
+
+        filetypes = [
+            ("PNG image", "*.png"),
+            ("PDF file", "*.pdf"),
+            ("SVG file", "*.svg"),
+            ("All files", "*.*"),
+        ]
+
+        filename = filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=".png",
+            initialfile=initialfile,
+            filetypes=filetypes,
+        )
+        if not filename:
+            return None
+
+        try:
+            fig.savefig(filename, dpi=300, bbox_inches="tight")
+        except Exception as e:
+            messagebox.showerror("Save plots", f"Failed to save figure:\n{e}")
+            return None
+
+        return filename
+
+    def on_save_plots_main(self):
+        """
+        Save the main (right-panel) figure containing:
+          - average correlation
+          - typical correlation
+          - gap distribution
+        """
+        saved = self._save_figure_via_dialog(
+            self.fig_main,
+            title="Save main plots (correlations & gaps)",
+            initialfile="main_plots.png",
+        )
+        if saved:
+            messagebox.showinfo("Save plots", f"Saved:\n{saved}")
+
+    def on_save_plots_gs(self):
+        """
+        Save the ground-state singlet-circle figure (if open).
+        """
+        if self.gs_fig is None:
+            messagebox.showinfo("Save plots", "Ground-state view is not open (no figure to save).")
+            return
+        saved = self._save_figure_via_dialog(
+            self.gs_fig,
+            title="Save ground-state singlet plot",
+            initialfile="ground_state.png",
+        )
+        if saved:
+            messagebox.showinfo("Save plots", f"Saved:\n{saved}")
+
+    def on_save_plots_gap_scaling(self):
+        """
+        Save the batch gap-scaling figure (if open).
+        """
+        if self.gap_fig is None:
+            messagebox.showinfo("Save plots", "Gap-scaling window is not open (no figure to save).")
+            return
+        saved = self._save_figure_via_dialog(
+            self.gap_fig,
+            title="Save gap-scaling plot",
+            initialfile="gap_scaling.png",
+        )
+        if saved:
+            messagebox.showinfo("Save plots", f"Saved:\n{saved}")
+
+    # ------------------------------------------------------------------
     # Mode switching
     # ------------------------------------------------------------------
 
@@ -385,6 +477,7 @@ class SDRGGroundStateGUI:
             self.entry_M_single,
             self.btn_run_single,
             self.btn_show_gs,
+            self.btn_save_main,
         ]
         batch_widgets = [
             self.entry_L_min,
@@ -632,19 +725,12 @@ class SDRGGroundStateGUI:
             )
 
             # Fit ln C_typ(r) ≈ ln A - alpha * sqrt(r).
-            # We fit in log space:
-            #   x = sqrt(r), y = ln(C_typ)
-            #   y ≈ m x + b => ln C ≈ b + m sqrt(r)
-            # Compare with ln C ≈ ln A - alpha sqrt(r)
-            # => ln A = b, alpha = -m
             try:
                 x_fit = np.sqrt(r_plot_typ)
                 y_fit = np.log(C_plot_typ)
 
                 if x_fit.size >= 2:
                     # ---- Weighted fit: bias toward small distances ----
-                    # We choose weights w(r) = 1 / sqrt(r), so small r get
-                    # larger weight and large r get smaller weight.
                     r_for_w = r_plot_typ.astype(float)
                     weights = 1.0 / np.sqrt(r_for_w)
 
@@ -653,13 +739,10 @@ class SDRGGroundStateGUI:
                     alpha = -m
                     A = np.exp(b)
 
-                    # Construct fitted reference curve A e^{-alpha sqrt(r)}
                     C_ref_typ = A * np.exp(-alpha * x_fit)
 
-                    # Print the fit parameters so you see them in the console
                     print(f"[Typical weighted fit] A = {A:.6e}, alpha = {alpha:.6f}")
 
-                    # Plot reference
                     self.ax_corr_typ.loglog(
                         r_plot_typ,
                         C_ref_typ,
@@ -684,7 +767,6 @@ class SDRGGroundStateGUI:
             good = gaps[gaps > 0.0]
             log_gaps = -np.log(good)
 
-            # Make histogram a density: area normalized to 1
             self.ax_gap.hist(
                 log_gaps,
                 bins=40,
@@ -730,9 +812,11 @@ class SDRGGroundStateGUI:
 
         top = tk.Toplevel(self.master)
         top.title("Fisher activated scaling: -log Δ vs sqrt(L)")
+        self.gap_window = top
 
-        fig = plt.Figure(figsize=(6, 4))
-        ax = fig.add_subplot(111)
+        self.gap_fig = plt.Figure(figsize=(6, 4))
+        self.gap_ax = self.gap_fig.add_subplot(111)
+        ax = self.gap_ax
 
         if x_vals.size > 0:
             ax.scatter(x_vals, y_vals, color="k", label="data")
@@ -752,10 +836,29 @@ class SDRGGroundStateGUI:
         else:
             ax.set_title("No valid (L, gap) data to plot.")
 
-        canvas = FigureCanvasTkAgg(fig, master=top)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        fig.tight_layout()
-        canvas.draw_idle()
+        self.gap_canvas = FigureCanvasTkAgg(self.gap_fig, master=top)
+        self.gap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # NEW: save button in the gap scaling window
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(fill=tk.X, padx=6, pady=6)
+        ttk.Button(btn_frame, text="Save plot", command=self.on_save_plots_gap_scaling).pack(side=tk.LEFT)
+
+        self.gap_fig.tight_layout()
+        self.gap_canvas.draw_idle()
+
+        top.protocol("WM_DELETE_WINDOW", self.on_close_gap_window)
+
+    def on_close_gap_window(self):
+        try:
+            if self.gap_window is not None:
+                self.gap_window.destroy()
+        except Exception:
+            pass
+        self.gap_window = None
+        self.gap_fig = None
+        self.gap_ax = None
+        self.gap_canvas = None
 
     # ------------------------------------------------------------------
     # Ground-state visualization window
@@ -787,7 +890,7 @@ class SDRGGroundStateGUI:
         self.gs_canvas = FigureCanvasTkAgg(self.gs_fig, master=self.gs_window)
         self.gs_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Sample slider
+        # Controls row: slider + save button
         slider_frame = ttk.Frame(self.gs_window)
         slider_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -806,6 +909,9 @@ class SDRGGroundStateGUI:
 
         self.gs_sample_label = ttk.Label(slider_frame, text="0 / 0")
         self.gs_sample_label.pack(side=tk.LEFT, padx=5)
+
+        # NEW: save button for GS plot
+        ttk.Button(slider_frame, text="Save plot", command=self.on_save_plots_gs).pack(side=tk.RIGHT)
 
         self.gs_window.protocol("WM_DELETE_WINDOW", self.on_close_gs_window)
 
