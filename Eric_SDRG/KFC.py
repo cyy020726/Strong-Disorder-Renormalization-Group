@@ -361,9 +361,12 @@ if __name__ == "__main__":
     
     #-------------------------------------------------------------------------------------------
     #this code computes the infinite randomness fixpoint energy scaling for lowest energy excitation and compares it to the theoretical predictions of the fisher scaling
-    
-    
-    L_list = [16, 32, 64, 96, 128, 192]
+    L_list = []
+    for i in range(2, 9):
+        L_list.append(2**i)
+    print(L_list)
+
+    #L_list = [16, 32, 64, 96, 128, 192, 256, 320]
     
     # Number of samples per size
     M = 500   # increase to 2000+ for publication-quality
@@ -374,6 +377,7 @@ if __name__ == "__main__":
     # Plot the activated scaling
     plot_fisher_gap_scaling(L_list, gaps_list)
 
+    """
     L = 300
     M = 2000
     gaps, all_lengths, all_omegas, L0 = sdrg_ensemble(
@@ -386,3 +390,6 @@ if __name__ == "__main__":
     plot_length_vs_energy(all_lengths, all_omegas)
     plot_fisher_scaling(all_lengths, all_omegas)
     plot_correlations(r_vals, C_r)
+    """
+    
+    
