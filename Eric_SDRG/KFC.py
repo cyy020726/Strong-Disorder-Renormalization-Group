@@ -333,6 +333,115 @@ def plot_fisher_gap_scaling(L_list, gaps_list):
     plt.tight_layout()
     plt.show()
     
+def survivors_at_scale(J_init, Omega_stop):
+    """
+    Run SDRG until the current cutoff Omega = max(J_s) drops below Omega_stop.
+    Return number of surviving spins N_rem.
+    """
+    J_s = [float(x) for x in J_init]
+    sites = list(range(len(J_s)))  # track remaining sites (labels not important here)
+
+    while len(J_s) >= 3:
+        n = len(J_s)
+        arr = np.array(J_s, dtype=float)
+        b = int(arr.argmax())
+        Omega = float(J_s[b])
+
+        if Omega <= Omega_stop:
+            break
+
+        left   = (b - 1) % n
+        center = b
+        right  = (b + 1) % n
+
+        J_L = J_s[left]
+        J_c = J_s[center]
+        J_R = J_s[right]
+        J_eff = (J_L * J_R / (2.0 * J_c)) if (J_c > 0.0) else 0.0
+
+        killed = sorted([center, right])
+        J_new = []
+        new_sites = []
+        for idx in range(n):
+            if idx in killed:
+                continue
+            if idx == left:
+                J_new.append(J_eff)
+                new_sites.append(sites[left])
+            else:
+                J_new.append(J_s[idx])
+                new_sites.append(sites[idx])
+
+        J_s = J_new
+        sites = new_sites
+
+    return len(sites)
+
+def susceptibility_ensemble(L, M, T_list, dist_name="Uniform(0,1)", seed=0):
+    """
+    For each T: run SDRG down to Omega=T, count survivors N_rem, estimate Curie susceptibility.
+    Returns:
+      chi_typ(T): geometric mean over disorder
+      chi_avg(T): arithmetic mean over disorder
+    """
+    rng = np.random.default_rng(seed)
+    J_ensemble = sample_couplings(L, M, dist_name, rng)
+
+    chi_typ = []
+    chi_avg = []
+
+    for T in T_list:
+        chi_samples = np.empty(M, dtype=float)
+        for s in range(M):
+            N_rem = survivors_at_scale(J_ensemble[s, :], Omega_stop=T)
+
+            # Curie for spin-1/2: chi ~ (const)*N_rem/T.
+            # If you only care about scaling, set const=1 and normalize by L:
+            chi_samples[s] = (N_rem / L) / T
+
+        # "typical" = geometric mean (good when distribution is broad)
+        chi_typ.append(np.exp(np.mean(np.log(chi_samples))))
+        chi_avg.append(np.mean(chi_samples))
+
+    return np.array(chi_typ), np.array(chi_avg)
+
+
+def estimate_Omega0(J_ensemble):
+    # typical microscopic cutoff (geometric mean of sample maxima)
+    sample_max = J_ensemble.max(axis=1)
+    return float(np.exp(np.mean(np.log(sample_max))))
+
+def fit_prefactor_A(T_list, chi_data, Omega0):
+    # Fit chi_data(T) ≈ A / [T log^2(Omega0/T)] in least squares on log scale
+    T = np.array(T_list, dtype=float)
+    f = 1.0 / (T * (np.log(Omega0 / T)**2))
+
+    # best A in linear least squares: minimize ||A f - chi||^2
+    A = float(np.dot(f, chi_data) / np.dot(f, f))
+    return A
+
+def chi_rs_theory(T, A=1.0, Omega0=1.0):
+    return A / (T * (np.log(Omega0 / T)**2))
+
+def plot_susceptibility(T_list, chi_typ, chi_avg=None, A=1.0, Omega0=1.0):
+    plt.figure(figsize=(6,4))
+    plt.loglog(T_list, chi_typ, 'o-', label="χ_typ (geom. mean)")
+    if chi_avg is not None:
+        plt.loglog(T_list, chi_avg, 's--', label="χ_avg")
+
+    plt.loglog(T_list, chi_rs_theory(np.array(T_list), A=A, Omega0=Omega0),
+               '-', label=rf"Theory  A/[T ln^2(Ω0/T)]")
+
+    plt.xlabel("T")
+    plt.ylabel("χ(T) (up to a constant)")
+    plt.title("Random-singlet susceptibility from SDRG cutoff at Ω=T")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    
+
+    
     
 # ---------- Minimal sanity check ----------
 
@@ -361,6 +470,7 @@ if __name__ == "__main__":
     
     #-------------------------------------------------------------------------------------------
     #this code computes the infinite randomness fixpoint energy scaling for lowest energy excitation and compares it to the theoretical predictions of the fisher scaling
+    """
     L_list = []
     for i in range(2, 9):
         L_list.append(2**i)
@@ -376,7 +486,8 @@ if __name__ == "__main__":
     
     # Plot the activated scaling
     plot_fisher_gap_scaling(L_list, gaps_list)
-
+    """
+    #-----------------------------------------------------
     """
     L = 300
     M = 2000
@@ -391,5 +502,35 @@ if __name__ == "__main__":
     plot_fisher_scaling(all_lengths, all_omegas)
     plot_correlations(r_vals, C_r)
     """
+    
+    #-----------------------------------------------------------------------------------------------------
+    #this code computes the magnetic susceptibility
+    L = 512
+    M = 500
+    seed = 42
+    T_list = np.logspace(-3, -1, 12)
+
+    rng = np.random.default_rng(seed)
+    J_ensemble = sample_couplings(L, M, "Abs Gaussian N(0,1)", rng)
+
+# reuse your routine but slightly refactor to accept J_ensemble:
+    chi_typ, chi_avg = [], []
+    for T in T_list:
+        chi_samples = np.empty(M, dtype=float)
+        for s in range(M):
+            N_rem = survivors_at_scale(J_ensemble[s, :], Omega_stop=T)
+            chi_samples[s] = (N_rem / L) / T
+        chi_typ.append(np.exp(np.mean(np.log(chi_samples))))
+        chi_avg.append(np.mean(chi_samples))
+
+    chi_typ = np.array(chi_typ)
+    chi_avg = np.array(chi_avg)
+
+    Omega0 = estimate_Omega0(J_ensemble)
+    A_fit  = fit_prefactor_A(T_list, chi_avg, Omega0)
+
+    print("Omega0_typ =", Omega0, " A_fit =", A_fit)
+
+    plot_susceptibility(T_list, chi_typ, chi_avg, A=A_fit, Omega0=Omega0)
     
     
