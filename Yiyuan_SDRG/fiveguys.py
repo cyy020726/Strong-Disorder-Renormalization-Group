@@ -1205,7 +1205,7 @@ class SDRGEnsembleGUI:
                 else:
                     heights = np.zeros_like(widths)
 
-                # Main empirical histogram
+                # Main empirical histogram (BLUE)
                 self.ax_J.bar(
                     centers,
                     heights,
@@ -1243,13 +1243,14 @@ class SDRGEnsembleGUI:
                 else:
                     heights_z = np.zeros_like(widths_z)
 
+                # Empirical ζ histogram (BLUE)
                 self.ax_zeta.bar(
                     centers_z,
                     heights_z,
                     width=widths_z,
                     align='center',
                     alpha=0.7,
-                    color='C1',
+                    color='C0',
                     edgecolor='black',
                     label='Empirical density (counts / (N·Δζ))',
                     zorder=2.0,
@@ -1275,7 +1276,8 @@ class SDRGEnsembleGUI:
                         self.ax_J.plot(
                             J_grid,
                             rho_th,
-                            'r-',
+                            color='g',
+                            linestyle='--',
                             lw=2,
                             label=r"Theory $\rho_\Omega(J)$ (density)"
                         )
@@ -1286,7 +1288,8 @@ class SDRGEnsembleGUI:
                         self.ax_zeta.plot(
                             z_grid,
                             P_th,
-                            'r-',
+                            color='g',
+                            linestyle='--',
                             lw=2,
                             label=r"Theory $P_\Gamma(\zeta)$ (density)"
                         )
@@ -1316,18 +1319,18 @@ class SDRGEnsembleGUI:
                     z = self.zeta_grid
                     Pz = self.P_zeta
 
-                    # ζ-space line (green) up to current zmax
+                    # ζ-space line (ORANGE)
                     mask_me_z = z <= zmax
                     if np.any(mask_me_z):
                         self.ax_zeta.plot(
                             z[mask_me_z],
                             Pz[mask_me_z],
-                            color='g',
+                            color='tab:orange',
                             lw=2,
                             label="Master eq $P(\\zeta)$"
                         )
 
-                    # J-space prediction ρ(J) from same P(ζ), with J = Ω e^{-ζ}
+                    # J-space prediction ρ(J) from same P(ζ), with J = Ω e^{-ζ} (ORANGE)
                     J_me = Omega_plot * np.exp(-z)
                     mask_me_J = (J_me > 0) & (J_me <= Omega_plot)
                     if np.any(mask_me_J):
@@ -1339,7 +1342,7 @@ class SDRGEnsembleGUI:
                         self.ax_J.plot(
                             J_line,
                             rho_line,
-                            color='g',
+                            color='tab:orange',
                             lw=2,
                             label="Master eq $\\rho(J)$"
                         )
