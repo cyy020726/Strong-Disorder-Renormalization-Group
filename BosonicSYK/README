@@ -1,0 +1,5 @@
+Here lies the code for the bosonic SYK. 
+For a single realization, use Single_protocol_miner.py first to collect data, and analyze in the Single_protocol_analysis.py. 
+For an ensemble of realizations, use the Ensemble files (miner for data collection, analysis for data analysis)
+The bench mark with a four-site direct solve is provided by the bench mark file. 
+Make sure you have h5py installed to be able to use the databases. 
