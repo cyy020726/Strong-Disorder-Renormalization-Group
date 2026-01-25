@@ -1,0 +1,886 @@
+"""
+LR2_distance_only.py
+
+Distance-only GUI for validating Section-6 long-range SDRG (all-to-all only).
+
+This script is adapted from your LR2.py ("long_range_section6_gui_alltoall_only_v2_savepdf.py") :contentReference[oaicite:0]{index=0}
+
+Changes vs LR2.py:
+- Removed the second (redundant) coupling-distribution subplot (J-space).
+- Increased font sizes (axis labels / tick labels / legend / title) so the exported PDF
+  remains readable in a two-column report.
+
+Everything else is unchanged:
+- Compute snapshots over "shells" in Omega.
+- Show histogram (numerics) + master-equation theory curve + fixed-point curve.
+- Slider + play/pause/stop.
+- Save current plot to PDF (what you see is what gets saved).
+"""
+
+from __future__ import annotations
+
+import math
+import time
+import heapq
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+# =============================================================================
+# Plot styling (paper-friendly)
+# =============================================================================
+
+TITLE_FONTSIZE  = 15
+LABEL_FONTSIZE  = 14
+TICK_FONTSIZE   = 11
+LEGEND_FONTSIZE = 12
+ANNOT_FONTSIZE  = 12
+
+
+# =============================================================================
+# 0) Tiny helpers: convert text boxes into numbers without crashing
+# =============================================================================
+
+def safe_int(s: str, default: int) -> int:
+    """Turn a string into an int; if it fails, return default."""
+    try:
+        return int(float(s))
+    except Exception:
+        return int(default)
+
+
+def safe_float(s: str, default: float) -> float:
+    """Turn a string into a float; if it fails, return default."""
+    try:
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+# =============================================================================
+# 1) Random gap distributions (sampling) + analytic PDFs (smooth starting curve)
+# =============================================================================
+
+DIST_NAMES = [
+    "Regular lattice (constant)",
+    "Uniform(0,1)",
+    "Exponential(λ=1)",
+    "Abs Gaussian N(0,1)",
+    "Log-normal(μ=0,σ=1)",
+    "Gamma(k=2,θ=1)",
+    "Fermi-Dirac(μ=0,T=1)",
+]
+
+
+def sample_fermi_dirac_positive(size: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Sample X >= 0 from pdf  p(x) ∝ 1/(exp(x)+1), normalized on [0,∞).
+    Simple rejection sampling with Exp(1) envelope.
+    """
+    out = np.empty(size, dtype=float)
+    i = 0
+    while i < size:
+        x = rng.exponential(scale=1.0)
+        u = rng.random()
+        # accept with probability exp(x)/(exp(x)+1)
+        if u < (math.exp(x) / (math.exp(x) + 1.0)):
+            out[i] = x
+            i += 1
+    return out
+
+
+def sample_gaps(num_gaps: int,
+                dist_name: str,
+                rng: np.random.Generator,
+                scale: float,
+                min_gap: float) -> np.ndarray:
+    """
+    Sample positive gaps with a *hard-core shift*:
+        gap = min_gap + scale * X,  where X >= 0.
+    This guarantees gap >= min_gap.
+    """
+    num_gaps = int(num_gaps)
+    if num_gaps <= 0:
+        return np.zeros((0,), dtype=float)
+
+    scale = max(float(scale), 0.0)
+    min_gap = max(float(min_gap), 0.0)
+
+    if dist_name == "Regular lattice (constant)":
+        X = np.ones(num_gaps, dtype=float)
+    elif dist_name == "Uniform(0,1)":
+        X = rng.random(num_gaps)
+    elif dist_name == "Exponential(λ=1)":
+        X = rng.exponential(scale=1.0, size=num_gaps)
+    elif dist_name == "Abs Gaussian N(0,1)":
+        X = np.abs(rng.normal(loc=0.0, scale=1.0, size=num_gaps))
+    elif dist_name == "Log-normal(μ=0,σ=1)":
+        X = rng.lognormal(mean=0.0, sigma=1.0, size=num_gaps)
+    elif dist_name == "Gamma(k=2,θ=1)":
+        X = rng.gamma(shape=2.0, scale=1.0, size=num_gaps)
+    elif dist_name == "Fermi-Dirac(μ=0,T=1)":
+        X = sample_fermi_dirac_positive(num_gaps, rng)
+    else:
+        X = rng.random(num_gaps)
+
+    return min_gap + scale * np.asarray(X, dtype=float)
+
+
+def analytic_gap_pdf(dist_name: str, r: np.ndarray, scale: float, min_gap: float) -> np.ndarray:
+    """
+    Smooth analytic PDF for the initial gap distribution.
+    This is used ONLY for the orange curve at shell 0.
+
+    Reminder: we sample r = min_gap + scale * X, with X>=0.
+    """
+    r = np.asarray(r, dtype=float)
+    scale = max(float(scale), 1e-300)
+    min_gap = max(float(min_gap), 0.0)
+
+    x = (r - min_gap) / scale
+    out = np.zeros_like(r)
+
+    mask = x >= 0
+    xm = x[mask]
+
+    if dist_name == "Regular lattice (constant)":
+        # A true delta function is not plottable; approximate by narrow Gaussian
+        r0 = min_gap + scale * 1.0
+        sigma = max(0.02 * r0, 1e-6)
+        out = (1.0 / (math.sqrt(2.0 * math.pi) * sigma)) * np.exp(-0.5 * ((r - r0) / sigma) ** 2)
+        return out
+
+    if dist_name == "Uniform(0,1)":
+        out[mask] = (1.0 / scale) * ((xm >= 0) & (xm <= 1)).astype(float)
+
+    elif dist_name == "Exponential(λ=1)":
+        out[mask] = (1.0 / scale) * np.exp(-xm)
+
+    elif dist_name == "Abs Gaussian N(0,1)":
+        out[mask] = (1.0 / scale) * math.sqrt(2.0 / math.pi) * np.exp(-0.5 * xm * xm)
+
+    elif dist_name == "Log-normal(μ=0,σ=1)":
+        m2 = xm > 0
+        out_mask = np.zeros_like(xm)
+        xx = xm[m2]
+        out_mask[m2] = (1.0 / (xx * math.sqrt(2.0 * math.pi))) * np.exp(-0.5 * (np.log(xx) ** 2))
+        out[mask] = (1.0 / scale) * out_mask
+
+    elif dist_name == "Gamma(k=2,θ=1)":
+        out[mask] = (1.0 / scale) * (xm * np.exp(-xm))
+
+    elif dist_name == "Fermi-Dirac(μ=0,T=1)":
+        out[mask] = (1.0 / (scale * math.log(2.0))) * (1.0 / (np.exp(xm) + 1.0))
+
+    else:
+        out[mask] = (1.0 / scale) * ((xm >= 0) & (xm <= 1)).astype(float)
+
+    return out
+
+
+# =============================================================================
+# 2) “Smoothing” helper for the orange curve, so it looks like a smooth theory
+# =============================================================================
+
+def gaussian_smooth_1d(h: np.ndarray, sigma_bins: float) -> np.ndarray:
+    """Blur a 1D array h by a Gaussian kernel of width sigma_bins (in bin units)."""
+    h = np.asarray(h, dtype=float)
+    if sigma_bins <= 0:
+        return h
+    radius = int(max(1, round(4.0 * sigma_bins)))
+    x = np.arange(-radius, radius + 1, dtype=float)
+    k = np.exp(-0.5 * (x / sigma_bins) ** 2)
+    k /= max(np.sum(k), 1e-300)
+    return np.convolve(h, k, mode="same")
+
+
+def normalize_density_on_bins(p: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    """
+    Normalize a binwise density p so that sum_k p_k * Δx_k = 1.
+    Needed for log-spaced bins.
+    """
+    p = np.asarray(p, dtype=float)
+    widths = np.diff(np.asarray(bin_edges, dtype=float))
+    if p.size != widths.size:
+        s = float(np.sum(p))
+        return p / max(s, 1e-300)
+    s = float(np.sum(p * widths))
+    return p / max(s, 1e-300)
+
+
+# =============================================================================
+# 3) SDRG model rules (this is the “physics” part)
+# =============================================================================
+
+def gamma_renormalize(gamma: float) -> float:
+    """
+    Anisotropy update (from the paper):
+        gamma -> 0.5 * gamma^2 * (1 + gamma)
+    """
+    g = float(gamma)
+    return 0.5 * g * g * (1.0 + g)
+
+
+def renormalized_distance_alltoall(RL: float, rho: float, RR: float, alpha: float, gamma: float) -> float:
+    """
+    The long-range (all-to-all) renormalized distance rule.
+
+    Inputs:
+      - rho: the smallest gap, being decimated (strongest bond)
+      - RL: the left neighbor gap
+      - RR: the right neighbor gap
+      - alpha: power in J(r) = r^{-alpha}
+      - gamma: anisotropy parameter
+
+    Output:
+      - r_tilde: the new effective gap after decimation
+
+    This implements the Eq.(35/36)-style function f(RL,RR,rho) used in Section 6.
+    """
+    RL = max(float(RL), 1e-300)
+    RR = max(float(RR), 1e-300)
+    rho = max(float(rho), 1e-300)
+    alpha = float(alpha)
+    gamma = float(gamma)
+
+    r_bare = RL + rho + RR
+    term_geom = (RL * RR / (r_bare * rho)) ** alpha
+
+    fL = 1.0 - (1.0 / (1.0 + rho / RL)) ** alpha
+    fR = 1.0 - (1.0 / (1.0 + rho / RR)) ** alpha
+
+    A = (1.0 / (1.0 + gamma)) * term_geom * fL * fR
+    if A < 1e-18:
+        return r_bare
+    return r_bare * (1.0 + A) ** (-1.0 / alpha)
+
+
+# =============================================================================
+# 4) A fast SDRG simulator on a ring (data structure trick)
+# =============================================================================
+
+@dataclass
+class RingSDRG:
+    values: np.ndarray
+    left: np.ndarray
+    right: np.ndarray
+    active: np.ndarray
+    version: np.ndarray
+    heap: List[Tuple[float, int, int]]
+    n_active: int
+    alpha: float
+    gamma: float
+
+    @staticmethod
+    def from_iid_gaps(n_sites: int,
+                     dist_name: str,
+                     rng: np.random.Generator,
+                     scale: float,
+                     min_gap: float,
+                     alpha: float,
+                     gamma: float) -> "RingSDRG":
+        n_sites = int(n_sites)
+        gaps = sample_gaps(n_sites, dist_name, rng, scale, min_gap)
+        values = np.array(gaps, dtype=float)
+
+        left = np.arange(n_sites, dtype=int) - 1
+        right = np.arange(n_sites, dtype=int) + 1
+        left[0] = n_sites - 1
+        right[-1] = 0
+
+        active = np.ones(n_sites, dtype=bool)
+        version = np.zeros(n_sites, dtype=int)
+
+        heap: List[Tuple[float, int, int]] = []
+        for i in range(n_sites):
+            heap.append((float(values[i]), int(i), int(version[i])))
+        heapq.heapify(heap)
+
+        return RingSDRG(
+            values=values,
+            left=left,
+            right=right,
+            active=active,
+            version=version,
+            heap=heap,
+            n_active=n_sites,
+            alpha=float(alpha),
+            gamma=float(gamma),
+        )
+
+    def all_active_gaps(self) -> np.ndarray:
+        return self.values[self.active].copy()
+
+    def _current_min_gap(self) -> Optional[Tuple[float, int]]:
+        while self.heap:
+            v, idx, ver = self.heap[0]
+            if (not self.active[idx]) or (ver != self.version[idx]):
+                heapq.heappop(self.heap)
+                continue
+            return float(v), int(idx)
+        return None
+
+    def current_Omega(self) -> float:
+        mg = self._current_min_gap()
+        if mg is None:
+            return 0.0
+        rho, _ = mg
+        rho = max(float(rho), 1e-300)
+        return rho ** (-self.alpha)
+
+    def _step_one_decimation(self) -> bool:
+        if self.n_active < 3:
+            return False
+
+        mg = self._current_min_gap()
+        if mg is None:
+            return False
+        rho, rho_id = mg
+
+        RL_id = int(self.left[rho_id])
+        RR_id = int(self.right[rho_id])
+
+        if (not self.active[RL_id]) or (not self.active[RR_id]):
+            return False
+
+        RL = float(self.values[RL_id])
+        RR = float(self.values[RR_id])
+        rho = float(rho)
+
+        new_gap = renormalized_distance_alltoall(RL, rho, RR, self.alpha, self.gamma)
+
+        eps = 1e-12
+        if not np.isfinite(new_gap):
+            new_gap = RL + rho + RR
+        new_gap = max(float(new_gap), float(rho) * (1.0 + eps))
+
+        L_of_RL = int(self.left[RL_id])
+        R_of_RR = int(self.right[RR_id])
+
+        self.values[RL_id] = float(new_gap)
+        self.version[RL_id] += 1
+
+        self.left[RL_id] = L_of_RL
+        self.right[RL_id] = R_of_RR
+        self.right[L_of_RL] = RL_id
+        self.left[R_of_RR] = RL_id
+
+        self.active[rho_id] = False
+        self.active[RR_id] = False
+        self.version[rho_id] += 1
+        self.version[RR_id] += 1
+        self.n_active -= 2
+
+        heapq.heappush(self.heap, (float(new_gap), int(RL_id), int(self.version[RL_id])))
+
+        self.gamma = gamma_renormalize(self.gamma)
+        return True
+
+    def decimate_until_Omega_below(self, Omega_low: float, max_steps: int = 10_000_000) -> int:
+        Omega_low = float(max(Omega_low, 0.0))
+        n = 0
+        while n < max_steps and self.n_active >= 3:
+            Om = self.current_Omega()
+            if Om < Omega_low or Om <= 0:
+                break
+            if not self._step_one_decimation():
+                break
+            n += 1
+        return n
+
+
+# =============================================================================
+# 5) Fixed point curve in r-space
+# =============================================================================
+
+def fixed_point_pdf_r(r: np.ndarray, rho: float) -> np.ndarray:
+    r = np.asarray(r, dtype=float)
+    rho = float(max(rho, 1e-300))
+    out = np.zeros_like(r)
+    mask = r >= rho
+    out[mask] = r[mask] ** (-1.5)
+    return out
+
+
+# =============================================================================
+# 6) GUI (distance plot only)
+# =============================================================================
+
+class Section6LongRangeGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Section-6 Long-range SDRG validation (distance-only, all-to-all)")
+
+        # User knobs
+        self.var_L = tk.StringVar(value="64")
+        self.var_M = tk.StringVar(value="200")
+        self.var_alpha = tk.StringVar(value="2.0")
+        self.var_gamma = tk.StringVar(value="1.0")
+
+        self.var_dist = tk.StringVar(value="Abs Gaussian N(0,1)")
+        self.var_scale = tk.StringVar(value="1.0")
+        self.var_min_gap = tk.StringVar(value="0.5")
+        self.var_seed = tk.StringVar(value="0")
+
+        self.var_bins = tk.StringVar(value="60")
+
+        self.var_dOmega = tk.StringVar(value="0.5")
+        self.var_shells = tk.StringVar(value="80")
+
+        self.var_N_theory = tk.StringVar(value="40000")
+        self.var_smooth_sigma = tk.StringVar(value="1.2")
+
+        # Internal state
+        self.snapshots: List[Dict] = []
+        self.current_index = 0
+        self.is_playing = False
+        self.play_ms = 200
+
+        self.r_bins: Optional[np.ndarray] = None
+        self.r_cent: Optional[np.ndarray] = None
+
+        self.progress = None
+
+        # Matplotlib figure (this is what we save to PDF)
+        # Keep it reasonably wide for the GUI; PDF is vector anyway.
+        self.fig = plt.Figure(figsize=(7.2, 4.2))
+        self.ax_r = self.fig.add_subplot(1, 1, 1)
+
+        self._build_layout()
+
+    def _apply_axis_style(self):
+        self.ax_r.tick_params(axis="both", which="major", labelsize=TICK_FONTSIZE)
+        self.ax_r.tick_params(axis="both", which="minor", labelsize=TICK_FONTSIZE)
+
+    def _build_layout(self):
+        outer = ttk.Frame(self.root, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(outer)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+
+        right = ttk.Frame(outer)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        frm = ttk.LabelFrame(left, text="Parameters (all-to-all long-range)")
+        frm.pack(fill=tk.X)
+
+        def row(rr, label, var, width=10):
+            ttk.Label(frm, text=label).grid(row=rr, column=0, sticky="w", pady=2)
+            ent = ttk.Entry(frm, textvariable=var, width=width)
+            ent.grid(row=rr, column=1, sticky="w", pady=2)
+            return ent
+
+        rr = 0
+        row(rr, "L (sites):", self.var_L); rr += 1
+        row(rr, "M (samples):", self.var_M); rr += 1
+        row(rr, "alpha:", self.var_alpha); rr += 1
+        row(rr, "gamma:", self.var_gamma); rr += 1
+
+        ttk.Label(frm, text="Initial gap dist:").grid(row=rr, column=0, sticky="w", pady=2)
+        ttk.Combobox(frm, textvariable=self.var_dist, values=DIST_NAMES,
+                     state="readonly", width=20).grid(row=rr, column=1, sticky="w", pady=2)
+        rr += 1
+
+        row(rr, "scale:", self.var_scale); rr += 1
+        row(rr, "min_gap:", self.var_min_gap); rr += 1
+        row(rr, "seed:", self.var_seed); rr += 1
+        row(rr, "# bins:", self.var_bins); rr += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(row=rr, column=0, columnspan=2, sticky="ew", pady=6)
+        rr += 1
+
+        row(rr, "dOmega:", self.var_dOmega); rr += 1
+        row(rr, "# shells:", self.var_shells); rr += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(row=rr, column=0, columnspan=2, sticky="ew", pady=6)
+        rr += 1
+
+        row(rr, "N_theory:", self.var_N_theory, width=12); rr += 1
+        row(rr, "smooth sigma:", self.var_smooth_sigma); rr += 1
+
+        # Buttons row 1: compute + play controls
+        btns = ttk.Frame(left)
+        btns.pack(fill=tk.X, pady=(8, 2))
+
+        self.btn_compute = ttk.Button(btns, text="Compute", command=self.on_compute)
+        self.btn_compute.grid(row=0, column=0, padx=2, sticky="ew")
+        self.btn_play = ttk.Button(btns, text="Play", command=self.on_play)
+        self.btn_play.grid(row=0, column=1, padx=2, sticky="ew")
+        self.btn_pause = ttk.Button(btns, text="Pause", command=self.on_pause)
+        self.btn_pause.grid(row=0, column=2, padx=2, sticky="ew")
+        self.btn_stop = ttk.Button(btns, text="Stop", command=self.on_stop)
+        self.btn_stop.grid(row=0, column=3, padx=2, sticky="ew")
+
+        for c in range(4):
+            btns.columnconfigure(c, weight=1)
+
+        # Buttons row 2: Save PDF
+        btns2 = ttk.Frame(left)
+        btns2.pack(fill=tk.X, pady=(2, 2))
+        btns2.columnconfigure(0, weight=1)
+        self.btn_save_pdf = ttk.Button(btns2, text="Save plot (PDF)", command=self.on_save_pdf)
+        self.btn_save_pdf.grid(row=0, column=0, padx=2, sticky="ew")
+
+        # Progress bar
+        ttk.Label(left, text="Compute progress (shells):").pack(anchor="w", pady=(6, 0))
+        self.progress = ttk.Progressbar(left, orient="horizontal", mode="determinate", length=220)
+        self.progress.pack(fill=tk.X, pady=(2, 6))
+        self.progress["value"] = 0
+
+        # Slider
+        self.slider = tk.Scale(left, from_=0, to=0, orient=tk.HORIZONTAL,
+                               showvalue=True, resolution=1, command=self.on_slider)
+        self.slider.pack(fill=tk.X, pady=(6, 2))
+        self.slider.configure(state="disabled")
+
+        # Info label
+        self.lbl_info = ttk.Label(left, text="No data yet.")
+        self.lbl_info.pack(fill=tk.X, pady=(4, 2))
+
+        # Canvas
+        canvas = FigureCanvasTkAgg(self.fig, master=right)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas = canvas
+
+        self._plot_empty()
+
+    def _plot_empty(self):
+        self.ax_r.clear()
+        self.ax_r.set_title("Distance distribution (density in log10 r)", fontsize=TITLE_FONTSIZE)
+        self.ax_r.set_xlabel("r (log x-axis)", fontsize=LABEL_FONTSIZE)
+        self.ax_r.set_ylabel(r"$dP/d\log_{10}(r)$", fontsize=LABEL_FONTSIZE)
+        self.ax_r.set_xscale("log")
+        self._apply_axis_style()
+
+        self.fig.tight_layout(pad=0.6)
+        self.canvas.draw_idle()
+
+    # ---------------- Save PDF button ----------------
+
+    def on_save_pdf(self):
+        """
+        Save the current figure to a PDF file.
+
+        - The file dialog lets you pick the name and location.
+        - Vector PDF via Matplotlib.
+        """
+        default_name = "section6_longrange_distance.pdf"
+        filename = filedialog.asksaveasfilename(
+            title="Save plot as PDF",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if not filename:
+            return
+        try:
+            # bbox_inches tight + a bit of padding -> avoids cropped labels in LaTeX
+            self.fig.savefig(filename, bbox_inches="tight", pad_inches=0.03)
+            messagebox.showinfo("Saved", f"Saved PDF:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Save error", f"Failed to save PDF:\n{e}")
+
+    # ---------------- Compute pipeline ----------------
+
+    def on_compute(self):
+        L = safe_int(self.var_L.get(), 64)
+        M = safe_int(self.var_M.get(), 200)
+        alpha = safe_float(self.var_alpha.get(), 2.0)
+        gamma0 = safe_float(self.var_gamma.get(), 1.0)
+        dist_name = self.var_dist.get()
+        scale = safe_float(self.var_scale.get(), 1.0)
+        min_gap = safe_float(self.var_min_gap.get(), 0.5)
+        seed = safe_int(self.var_seed.get(), 0)
+
+        nbins = safe_int(self.var_bins.get(), 60)
+        dOmega = safe_float(self.var_dOmega.get(), 0.5)
+        n_shells = safe_int(self.var_shells.get(), 80)
+
+        N_theory = safe_int(self.var_N_theory.get(), 40000)
+        smooth_sigma = safe_float(self.var_smooth_sigma.get(), 1.2)
+
+        if L < 6 or M <= 0 or alpha <= 0 or gamma0 <= 0 or min_gap <= 0:
+            messagebox.showerror("Input error", "Use L>=6, M>0, alpha>0, gamma>0, min_gap>0.")
+            return
+        if nbins < 10:
+            messagebox.showerror("Input error", "Use #bins >= 10.")
+            return
+        if dOmega <= 0 or n_shells <= 0:
+            messagebox.showerror("Input error", "Use dOmega>0 and #shells>0.")
+            return
+        if N_theory < 2000:
+            messagebox.showerror("Input error", "Use N_theory >= 2000.")
+            return
+
+        self.progress["maximum"] = max(1, n_shells)
+        self.progress["value"] = 0
+        self.root.update_idletasks()
+
+        self._set_buttons_state("disabled")
+        self.root.update_idletasks()
+
+        t0 = time.time()
+        rng = np.random.default_rng(seed)
+
+        # Ensemble
+        samples: List[RingSDRG] = []
+        for _ in range(M):
+            sub_rng = np.random.default_rng(rng.integers(0, 2**32 - 1))
+            samples.append(RingSDRG.from_iid_gaps(
+                n_sites=L,
+                dist_name=dist_name,
+                rng=sub_rng,
+                scale=scale,
+                min_gap=min_gap,
+                alpha=alpha,
+                gamma=gamma0,
+            ))
+
+        Omega0 = max(s.current_Omega() for s in samples)
+        if Omega0 <= 0:
+            messagebox.showerror("Compute error", "Omega0 computed as <= 0.")
+            self._set_buttons_state("normal")
+            return
+
+        # Large-ring theory sampler (same logic as LR2.py)
+        theory_rng = np.random.default_rng(rng.integers(0, 2**32 - 1))
+        theory = RingSDRG.from_iid_gaps(
+            n_sites=N_theory,
+            dist_name=dist_name,
+            rng=theory_rng,
+            scale=scale,
+            min_gap=min_gap,
+            alpha=alpha,
+            gamma=gamma0,
+        )
+
+        # r-bins
+        total_lengths = [float(np.sum(s.all_active_gaps())) for s in samples]
+        r_min = max(min_gap * 0.8, 1e-12)
+        r_max = max(max(total_lengths) * 1.2, r_min * 10.0)
+
+        r_bins = np.logspace(np.log10(r_min), np.log10(r_max), nbins + 1)
+        r_cent = np.sqrt(r_bins[:-1] * r_bins[1:])
+        self.r_bins = r_bins
+        self.r_cent = r_cent
+
+        def pooled_pdf(samples_now: List[RingSDRG]) -> np.ndarray:
+            gaps = np.concatenate([s.all_active_gaps() for s in samples_now])
+            gaps = gaps[gaps > 0]
+            if gaps.size == 0:
+                return np.zeros_like(r_cent)
+            hr, _ = np.histogram(gaps, bins=r_bins, density=True)
+            return hr
+
+        def theory_pdf(step: int) -> np.ndarray:
+            if step == 0:
+                pr = analytic_gap_pdf(dist_name, r_cent, scale, min_gap)
+                pr = normalize_density_on_bins(pr, r_bins)
+                return pr
+
+            gaps = theory.all_active_gaps()
+            gaps = gaps[gaps > 0]
+            if gaps.size == 0:
+                return np.zeros_like(r_cent)
+
+            pr, _ = np.histogram(gaps, bins=r_bins, density=True)
+            pr = gaussian_smooth_1d(pr, smooth_sigma)
+            pr = normalize_density_on_bins(pr, r_bins)
+            return pr
+
+        def fixed_point_curve(rho: float) -> np.ndarray:
+            pr = fixed_point_pdf_r(r_cent, rho=rho)
+            pr = normalize_density_on_bins(pr, r_bins)
+            return pr
+
+        snapshots: List[Dict] = []
+
+        hr0 = pooled_pdf(samples)
+        tr0 = theory_pdf(step=0)
+
+        rho0 = Omega0 ** (-1.0 / alpha)
+        fp_r0 = fixed_point_curve(rho=rho0)
+
+        snapshots.append({
+            "shell": 0,
+            "Omega_high": Omega0,
+            "Omega_low": max(0.0, Omega0 - dOmega),
+            "rho": rho0,
+            "hist_r": hr0,
+            "theory_r": tr0,
+            "fp_r": fp_r0,
+        })
+
+        shells_done = 0
+        for n in range(1, n_shells + 1):
+            Omega_high = Omega0 - (n - 1) * dOmega
+            Omega_low = max(0.0, Omega_high - dOmega)
+            if Omega_high <= 0:
+                break
+
+            for s in samples:
+                s.decimate_until_Omega_below(Omega_low)
+            theory.decimate_until_Omega_below(Omega_low)
+
+            hr = pooled_pdf(samples)
+            tr = theory_pdf(step=n)
+
+            rho = (Omega_low if Omega_low > 0 else max(Omega_high, 1e-300)) ** (-1.0 / alpha)
+            fp_r = fixed_point_curve(rho=rho)
+
+            snapshots.append({
+                "shell": n,
+                "Omega_high": Omega_high,
+                "Omega_low": Omega_low,
+                "rho": rho,
+                "hist_r": hr,
+                "theory_r": tr,
+                "fp_r": fp_r,
+            })
+
+            shells_done = n
+            self.progress["value"] = shells_done
+            self.root.update_idletasks()
+
+            if all(s.n_active < 3 for s in samples):
+                break
+
+        self.progress["value"] = min(self.progress["maximum"], max(1, shells_done))
+        self.root.update_idletasks()
+
+        self.snapshots = snapshots
+        self.current_index = 0
+
+        self.slider.configure(state="normal", from_=0, to=max(0, len(snapshots) - 1))
+        self.slider.set(0)
+        self._render_snapshot(0)
+
+        dt = time.time() - t0
+        self.lbl_info.config(
+            text=f"Computed {len(snapshots)} shells in {dt:.2f}s. "
+                 f"(N_theory={N_theory}, dOmega={dOmega})"
+        )
+
+        self._set_buttons_state("normal")
+
+    def _render_snapshot(self, idx: int):
+        if (not self.snapshots) or (self.r_bins is None) or (self.r_cent is None):
+            self._plot_empty()
+            return
+
+        LN10 = math.log(10.0)
+
+        idx = int(max(0, min(idx, len(self.snapshots) - 1)))
+        snap = self.snapshots[idx]
+
+        r_bins = self.r_bins
+        r_cent = self.r_cent
+        r_mid = np.sqrt(r_bins[:-1] * r_bins[1:])
+
+        # density in log10 r:  dP/d log10 r = (ln 10) * r * p(r)
+        hist_r_plot = LN10 * r_mid * snap["hist_r"]
+        theory_r_plot = LN10 * r_cent * snap["theory_r"]
+        fp_r_plot = LN10 * r_cent * snap["fp_r"]
+
+        self.ax_r.clear()
+
+        self.ax_r.bar(
+            r_bins[:-1],
+            hist_r_plot,
+            width=np.diff(r_bins),
+            align="edge",
+            color="C0",
+            alpha=0.35,
+            edgecolor="C0",
+            linewidth=0.4,
+            label="Numerics (hist)",
+            zorder=1,
+        )
+        self.ax_r.plot(r_cent, theory_r_plot, color="C1", linewidth=2.0, label="Master eq (MC / large ring)")
+        self.ax_r.plot(r_cent, fp_r_plot, color="C2", linestyle="--", linewidth=2.0, label="Fixed point")
+
+        self.ax_r.set_xscale("log")
+        self.ax_r.set_title("Distance distribution (density in log10 r)", fontsize=TITLE_FONTSIZE)
+        self.ax_r.set_xlabel("r (log x-axis)", fontsize=LABEL_FONTSIZE)
+        self.ax_r.set_ylabel(r"$dP/d\log_{10}(r)$", fontsize=LABEL_FONTSIZE)
+
+        self._apply_axis_style()
+        self.ax_r.legend(loc="best", fontsize=LEGEND_FONTSIZE, frameon=False)
+
+        self.ax_r.text(
+            0.98, 0.96,
+            f"shell={snap['shell']}\nΩ∈[{snap['Omega_low']:.3g},{snap['Omega_high']:.3g}]\nρ≈{snap['rho']:.3g}",
+            transform=self.ax_r.transAxes,
+            ha="right", va="top", fontsize=ANNOT_FONTSIZE,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        )
+
+        self.fig.tight_layout(pad=0.6)
+        self.canvas.draw_idle()
+
+    def on_slider(self, value):
+        if not self.snapshots:
+            return
+        idx = safe_int(value, 0)
+        self.current_index = idx
+        self._render_snapshot(idx)
+
+    def on_play(self):
+        if not self.snapshots:
+            messagebox.showinfo("Play", "Compute first.")
+            return
+        if self.is_playing:
+            return
+        self.is_playing = True
+        self._play_tick()
+
+    def _play_tick(self):
+        if not self.is_playing:
+            return
+        nxt = self.current_index + 1
+        if nxt >= len(self.snapshots):
+            self.is_playing = False
+            return
+        self.slider.set(nxt)
+        self.current_index = nxt
+        self.root.after(self.play_ms, self._play_tick)
+
+    def on_pause(self):
+        self.is_playing = False
+
+    def on_stop(self):
+        self.is_playing = False
+        if self.snapshots:
+            self.slider.set(0)
+            self.current_index = 0
+
+    def _set_buttons_state(self, state: str):
+        for b in [self.btn_compute, self.btn_play, self.btn_pause, self.btn_stop]:
+            try:
+                b.configure(state=state)
+            except Exception:
+                pass
+        # Slider disabled during compute.
+        if state == "disabled":
+            self.slider.configure(state="disabled")
+
+
+def main():
+    root = tk.Tk()
+    _ = Section6LongRangeGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+Make sure to have h5py install via pip. To obtain the database of Green's functions, use Ensemble_protocol_miner_RAW_H5. This will generate a database for you which you can upload to Ensemble_protocol_analysi_RAW_H5 for data analysis. If you wich to extract correlation length, upload the database to Correlation_length. 
+
+If one wants to bench mark our method for a small system of four clusters, use the foursite_benchmark file. Please leave the Single_protocol_miner as is, because the ensemble miner depends on it to function.
