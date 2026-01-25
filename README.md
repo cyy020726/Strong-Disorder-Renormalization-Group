@@ -1,2 +1,2 @@
 # Strong-Disorder-Renormalization-Group
-This is the repository for the final project of the course Advanced Methods for Many-body Physics on Strongly Disordered Renormalization Group. The Hamiltonian_SDRG folder contains the code relating to the spin-1/2 Heisenberg chain. The BosonicSYK folder contains the code relating to the SDRG-on-SD formalism on the bosonic SYK cluster chain. 
+This is the repository for the final project of the course Advanced Methods for Many-body Physics on Strongly Disordered Renormalization Group. The Hamiltonian_SDRG folder contains the code relating to the spin-1/2 Heisenberg chain and the long-range model. The BosonicSYK folder contains the code relating to the SDRG-on-SD formalism on the bosonic SYK cluster chain. 
